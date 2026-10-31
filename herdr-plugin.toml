@@ -1,0 +1,31 @@
+id = "collie"
+name = "Collie"
+version = "0.1.0"
+description = "Project cockpit for you and your agents: run, watch logs, test and stop, and call dibs on ports, simulators and devices."
+min_herdr_version = "0.9.0"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# `collie daemon` detaches and returns, so this stays a one-shot hook; the daemon outlives it on purpose.
+[[startup]]
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/collie\" daemon"]
+
+# Pane commands run with cwd = the user's directory, not the plugin root (see herdr-lazygit),
+# which is also what the TUI detects targets from.
+[[panes]]
+id = "panel"
+title = "Collie"
+placement = "split"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/collie\" tui"]
+
+[[actions]]
+id = "open"
+title = "Open Collie"
+command = ["bash", "scripts/open.sh"]
+
+[[actions]]
+id = "run-current"
+title = "Run current project"
+command = ["bash", "scripts/run-current.sh"]

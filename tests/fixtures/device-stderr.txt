@@ -1,0 +1,18 @@
+2026-10-29 15:58:06.155001+0100 Demo_Dev[41709:12033706] [Firebase/Crashlytics] Version 12.19.2
+2026-10-29 15:58:06.441197+0100 Demo_Dev[41709:12033783] [system] ℹ️ INFO: APIManager - Found keychain access/refresh tokens. Validating access token on startup.
+Time: 15:58:06 GMT+1, 1793285886.381569
+Details: nil
+user_uuid: 00000000000000000000000000000001
+2026-10-29 15:58:06.509086+0100 Demo_Dev[41709:12033782] [system] ℹ️ INFO: Sending Request GET to URL: https://api.example.com/auth/validate
+Time: 15:58:06 GMT+1, 1793285886.508937
+Details: Endpoint: validate
+Context: Header names: Accept, Authorization, Content-Type
+Body bytes: 0
+user_uuid: 00000000000000000000000000000001
+2026-10-29 15:58:06.511808+0100 Demo_Dev[41709:12033782] [system] ⚠️ WARN: Analytics service not available - event not tracked
+Time: 15:58:06 GMT+1, 1793285886.511619
+Details: nil
+Context: contexts=[]
+event=appOrientationMode
+action=<none>
+user_uuid: 00000000000000000000000000000001

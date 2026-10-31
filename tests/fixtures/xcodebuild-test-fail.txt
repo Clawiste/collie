@@ -1,0 +1,25 @@
+Test Suite 'All tests' started at 2026-10-28 22:29:57.788.
+Test Suite 'SumTests.xctest' started at 2026-10-28 22:29:57.792.
+Test Suite 'SumXCTests' started at 2026-10-28 22:29:57.792.
+Test Case '-[SumTests.SumXCTests testAdds]' started.
+Test Case '-[SumTests.SumXCTests testAdds]' passed (0.001 seconds).
+Test Case '-[SumTests.SumXCTests testFails]' started.
+/tmp/xfail/Tests/SumTests/SumTests.swift:10: error: -[SumTests.SumXCTests testFails] :
+Test Case '-[SumTests.SumXCTests testFails]' failed (1.194 seconds).
+Test Suite 'SumXCTests' failed at 2026-10-28 22:29:58.995.
+	 Executed 2 tests, with 1 failure (0 unexpected) in 1.195 (1.203) seconds
+Test Suite 'SumTests.xctest' failed at 2026-10-28 22:29:58.995.
+	 Executed 2 tests, with 1 failure (0 unexpected) in 1.195 (1.203) seconds
+Test Suite 'All tests' failed at 2026-10-28 22:29:58.996.
+	 Executed 2 tests, with 1 failure (0 unexpected) in 1.195 (1.208) seconds
+◇ Test run started.
+↳ Testing Library Version: 2084
+↳ Target Platform: arm64-apple-ios17.0-simulator
+◇ Test failsSwiftTesting() started.
+◇ Test addsSwiftTesting() started.
+✔ Test addsSwiftTesting() passed after 0.001 seconds.
+✘ Test failsSwiftTesting() recorded an issue at SumTests.swift:6:34: Expectation failed: Sum.add(1, 2) == 4
+↳ Sum.add(1, 2) == 4 → false
+↳   Sum.add(1, 2) → 3
+✘ Test failsSwiftTesting() failed after 0.017 seconds with 1 issue.
+✘ Test run with 2 tests in 0 suites failed after 0.020 seconds with 1 issue.

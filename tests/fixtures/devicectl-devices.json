@@ -1,0 +1,165 @@
+{
+ "info": {
+  "commandType": "devicectl.list.devices",
+  "jsonVersion": 5,
+  "outcome": "success",
+  "version": "651.13.5"
+ },
+ "result": {
+  "devices": [
+   {
+    "identifier": "00000000-0000-0000-0000-000000000001",
+    "properties": {
+     "hardware": {
+      "deviceType": "iPhone",
+      "marketingName": "iPhone 16 Pro",
+      "platform": "iOS",
+      "productType": "iPhone17,1",
+      "reality": "simulated",
+      "udid": "00000000-0000-0000-0000-000000000001"
+     },
+     "state": {
+      "bootState": "booted",
+      "name": "collie 3"
+     },
+     "software": {
+      "osVersionNumber": {
+       "components": [
+        27,
+        0,
+        0,
+        0,
+        0
+       ],
+       "originalComponentsCount": 2,
+       "stringValue": "27.0"
+      }
+     },
+     "connection": {
+      "pairingState": "paired",
+      "state": "connected",
+      "transportType": "sameMachine"
+     }
+    }
+   },
+   {
+    "identifier": "00000000-0000-0000-0000-0000000000A2",
+    "properties": {
+     "hardware": {
+      "deviceType": "iPad",
+      "marketingName": "iPad (9th generation)",
+      "platform": "iOS",
+      "productType": "iPad12,2",
+      "reality": "physical",
+      "udid": "00000000-0000000000000002"
+     },
+     "state": {
+      "bootState": "booted",
+      "developerModeStatus": {
+       "enabled": {
+        "mode": 1
+       }
+      },
+      "name": "iPad"
+     },
+     "software": {
+      "osVersionNumber": {
+       "components": [
+        18,
+        3,
+        1,
+        0,
+        0
+       ],
+       "originalComponentsCount": 3,
+       "stringValue": "18.3.1"
+      }
+     },
+     "connection": {
+      "pairingState": "paired",
+      "state": "disconnected",
+      "transportType": "localNetwork"
+     }
+    }
+   },
+   {
+    "identifier": "00000000-0000-0000-0000-0000000000A3",
+    "properties": {
+     "hardware": {
+      "deviceType": "iPhone",
+      "marketingName": "iPhone 13 mini",
+      "platform": "iOS",
+      "productType": "iPhone14,4",
+      "reality": "physical",
+      "udid": "00000000-0000000000000003"
+     },
+     "state": {
+      "developerModeStatus": {
+       "enabled": {
+        "mode": 1
+       }
+      },
+      "name": "iPhone 13 mini"
+     },
+     "software": {
+      "osVersionNumber": {
+       "components": [
+        27,
+        0,
+        1,
+        0,
+        0
+       ],
+       "originalComponentsCount": 3,
+       "stringValue": "27.0.1"
+      }
+     },
+     "connection": {
+      "pairingState": "paired",
+      "state": "unavailable"
+     }
+    }
+   },
+   {
+    "identifier": "00000000-0000-0000-0000-0000000000A1",
+    "properties": {
+     "hardware": {
+      "deviceType": "iPhone",
+      "marketingName": "iPhone 13 Pro",
+      "platform": "iOS",
+      "productType": "iPhone14,2",
+      "reality": "physical",
+      "udid": "00000000-0000000000000001"
+     },
+     "state": {
+      "bootState": "booted",
+      "developerModeStatus": {
+       "enabled": {
+        "mode": 1
+       }
+      },
+      "name": "Test iPhone"
+     },
+     "software": {
+      "osVersionNumber": {
+       "components": [
+        27,
+        0,
+        0,
+        0,
+        0
+       ],
+       "originalComponentsCount": 2,
+       "stringValue": "27.0"
+      }
+     },
+     "connection": {
+      "pairingState": "paired",
+      "state": "connected",
+      "transportType": "localNetwork"
+     }
+    }
+   }
+  ]
+ }
+}

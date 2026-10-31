@@ -1,0 +1,23 @@
+2026-10-30 17:17:58.710236+0100 MyApp[44281:12765710] [networkClient] GET /api/profile → error
+[
+  "baseURL": .string("https://api.example.com"),
+  "endpoint": .string("/api/profile"),
+  "error": .string(
+    """
+    Client encountered an error invoking the operation "get_profile", caused by "Transport threw an error.", underlying error: Error Domain=NSURLErrorDomain Code=-999 "cancelled" UserInfo={NSErrorFailingURLStringKey=https://api.example.com/api/profile, NSErrorFailingURLKey=https://api.example.com/api/profile, _NSURLErrorRelatedURLSessionTaskErrorKey=(
+        "LocalDataTask <00000000-0000-0000-0000-000000000001>.<1>"
+    ), _NSURLErrorFailingURLSessionTaskErrorKey=LocalDataTask <00000000-0000-0000-0000-000000000001>.<1>, NSLocalizedDescription=cancelled}.
+    """
+  ),
+  "headers": .string(
+    """
+    [
+      "Accept": "application/json",
+      "traceparent": "00-00000000000000000000000000000001-0000000000000001-01"
+    ]
+    """
+  ),
+  "method": .string("GET"),
+  "status": .string("<no status>")
+]
+2026-10-30 17:17:58.710434+0100 MyApp[44281:12765703] [network] DEBUG: ℹ️ API request started: POST '/v1/config/app'

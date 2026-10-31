@@ -1,0 +1,17 @@
+/Users/dev/Projects/demo/demo-ios/Packages/StepFlow/Module/Sources/Views/StepContainerView.swift:85:95: warning: main actor-isolated property 'isOnInnerDisplay' can not be referenced from a nonisolated autoclosure
+ 83 |             }
+ 84 |             .onGeometryChange(for: CGFloat.self) { geometry in
+ 85 |                 geometry.size.height * (activity.ignoresVerticalContainerSafeArea || activity.isOnInnerDisplay
+    |                                                                                            `- warning: main actor-isolated property 'isOnInnerDisplay' can not be referenced from a nonisolated autoclosure
+ 86 |                     ? Constants.innerSelectionHeightFraction : Constants.selectionHeightFraction)
+ 87 |             } action: { height in
+
+/Users/dev/Projects/demo/demo-ios/Packages/StepFlow/Module/Sources/Views/StepPagerView.swift:587:9: note: property declared here
+585 |     var isActive = false
+586 |     var ignoresVerticalContainerSafeArea = false
+587 |     var isOnInnerDisplay = false
+    |         `- note: property declared here
+588 | }
+589 |
+
+/Users/dev/Projects/demo/demo-ios/scripts/Swift/Sources/Release/Operations/ApplyAPIKey.swift:24:46: warning: Empty String Violation: Prefer checking `isEmpty` over comparing `string` to an empty string literal (empty_string)

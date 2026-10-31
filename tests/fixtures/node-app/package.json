@@ -1,0 +1,9 @@
+{
+  "name": "node-app",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "lint": "echo lint ok",
+    "test": "node --test"
+  }
+}

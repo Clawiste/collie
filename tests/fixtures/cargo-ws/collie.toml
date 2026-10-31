@@ -1,0 +1,5 @@
+[targets.alpha]
+port = 3999
+
+[tasks.lint]
+cmd = "printf '%s|' 'a#b' \"c=d\"" # run args follow c=d

@@ -1,0 +1,95 @@
+Test Suite 'All tests' started at 2026-10-28 22:26:15.573.
+Test Suite 'All tests' passed at 2026-10-28 22:26:15.576.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.003) seconds
+◇ Test run started.
+↳ Testing Library Version: 2084
+↳ Target Platform: arm64-apple-ios17.0-simulator
+◇ Suite ReadingTimeTests started.
+◇ Test "Reading longer than the expected time caps the progress at one" started.
+✔ Test "Reading longer than the expected time caps the progress at one" passed after 0.002 seconds.
+◇ Test "Reading half the expected time gives half progress" started.
+✔ Test "Reading half the expected time gives half progress" passed after 0.001 seconds.
+◇ Test "Without an expected time any real read reaches full progress" started.
+✔ Test "Without an expected time any real read reaches full progress" passed after 0.001 seconds.
+◇ Test "A zero read has no progress" started.
+✔ Test "A zero read has no progress" passed after 0.001 seconds.
+◇ Test "Opening a link is a binary signal and carries no progress" started.
+✔ Test "Opening a link is a binary signal and carries no progress" passed after 0.001 seconds.
+✔ Suite ReadingTimeTests passed after 0.032 seconds.
+◇ Suite NoteLinkTests started.
+◇ Test "A note-scheme link's value is the note URL it wraps" started.
+✔ Test "A note-scheme link's value is the note URL it wraps" passed after 0.004 seconds.
+✔ Suite NoteLinkTests passed after 0.004 seconds.
+◇ Suite NoteSyncRecoveryTests started.
+◇ Test "A note 404 deletes the note, and the delete cascades to its tags and attachments" started.
+✔ Test "A note 404 deletes the note, and the delete cascades to its tags and attachments" passed after 0.333 seconds.
+✔ Suite NoteSyncRecoveryTests passed after 0.333 seconds.
+◇ Suite NoteArchiveOperationTests started.
+◇ Test "Archiving a draft-only note archives its pages and stores the full note the server returns" started.
+✔ Test "Archiving a draft-only note archives its pages and stores the full note the server returns" passed after 0.224 seconds.
+✔ Suite NoteArchiveOperationTests passed after 0.224 seconds.
+◇ Suite NotePinOperationTests started.
+◇ Test "Pinning applies optimistically and confirming persists the server's pin as truth" started.
+✔ Test "Pinning applies optimistically and confirming persists the server's pin as truth" passed after 0.019 seconds.
+◇ Test "A failed pin rolls the optimistic pin back" started.
+✔ Test "A failed pin rolls the optimistic pin back" passed after 0.050 seconds.
+✔ Suite NotePinOperationTests passed after 0.070 seconds.
+◇ Suite NotePlaceholderTests started.
+◇ Test "The empty note is its base with the body dropped" started.
+✔ Test "The empty note is its base with the body dropped" passed after 0.013 seconds.
+✔ Suite NotePlaceholderTests passed after 0.013 seconds.
+◇ Suite PageReadOperationTests started.
+◇ Test "Reading a page lowers its note's unread count, then confirm stores the server's count" started.
+✔ Test "Reading a page lowers its note's unread count, then confirm stores the server's count" passed after 0.019 seconds.
+✔ Suite PageReadOperationTests passed after 0.020 seconds.
+◇ Suite NoteRecordPersistenceTests started.
+◇ Test "Persisting a note upserts its tag parents so the note reads back with its tags" started.
+✔ Test "Persisting a note upserts its tag parents so the note reads back with its tags" passed after 0.010 seconds.
+◇ Test "Persisting a draft saves its never-stored tags first, so the draft reads back with its tag links" started.
+✔ Test "Persisting a draft saves its never-stored tags first, so the draft reads back with its tag links" passed after 0.013 seconds.
+◇ Test "Persisting a note rewrites its tags but leaves existing tag colors intact" started.
+✔ Test "Persisting a note rewrites its tags but leaves existing tag colors intact" passed after 0.012 seconds.
+◇ Test "The hydrated note draft composes the note's own columns with its folder and tags" started.
+✔ Test "The hydrated note draft composes the note's own columns with its folder and tags" passed after 0.011 seconds.
+◇ Test "A user draft over a full note updates the shared values and keeps the body" started.
+✔ Test "A user draft over a full note updates the shared values and keeps the body" passed after 0.007 seconds.
+◇ Test "Inserting a draft creates no body row and no folder count row" started.
+✔ Test "Inserting a draft creates no body row and no folder count row" passed after 0.008 seconds.
+◇ Test "A draft-only folder is absent from full-folder reads and appears once a full folder is saved" started.
+✔ Test "A draft-only folder is absent from full-folder reads and appears once a full folder is saved" passed after 0.006 seconds.
+◇ Test "A staged pin and archive read the same through both hydrations and survive a draft upsert" started.
+✔ Test "A staged pin and archive read the same through both hydrations and survive a draft upsert" passed after 0.011 seconds.
+✔ Suite NoteRecordPersistenceTests passed after 0.082 seconds.
+◇ Suite NoteSchemaInverseTests started.
+◇ Test "Components.Schemas.Note.toNote maps every Note field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.Note.toNote maps every Note field onto the field of the same meaning" passed after 0.016 seconds.
+◇ Test "Components.Schemas.NoteDraft.toNoteDraft maps every Note.Draft field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.NoteDraft.toNoteDraft maps every Note.Draft field onto the field of the same meaning" passed after 0.016 seconds.
+◇ Test "Components.Schemas.NoteCount.toNoteCount maps every Note.Count field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.NoteCount.toNoteCount maps every Note.Count field onto the field of the same meaning" passed after 0.020 seconds.
+◇ Test "Components.Schemas.PageDraft.toPageDraft maps every Page.Draft field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.PageDraft.toPageDraft maps every Page.Draft field onto the field of the same meaning" passed after 0.021 seconds.
+◇ Test "Components.Schemas.PageUser.toPage maps every Page field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.PageUser.toPage maps every Page field onto the field of the same meaning" passed after 0.006 seconds.
+◇ Test "Components.Schemas.PageUserDraft.toPageDraft maps every Page.Draft field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.PageUserDraft.toPageDraft maps every Page.Draft field onto the field of the same meaning" passed after 0.005 seconds.
+◇ Test "Components.Schemas.NoteCursor.ChangeSetPayload.ValuesPayloadPayload.toNote maps every Note field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.NoteCursor.ChangeSetPayload.ValuesPayloadPayload.toNote maps every Note field onto the field of the same meaning" passed after 0.022 seconds.
+◇ Test "Components.Schemas.NoteCountCursor.ChangeSetPayload.toNoteCountChangeSet maps every ChangeSet<Note.Count> field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.NoteCountCursor.ChangeSetPayload.toNoteCountChangeSet maps every ChangeSet<Note.Count> field onto the field of the same meaning" passed after 0.018 seconds.
+◇ Test "Components.Schemas.NoteCountCursor.ChangeSetPayload.ValuesPayloadPayload.toNoteCount maps every Note.Count field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.NoteCountCursor.ChangeSetPayload.ValuesPayloadPayload.toNoteCount maps every Note.Count field onto the field of the same meaning" passed after 0.024 seconds.
+◇ Test "Components.Schemas.PageUserCursor.ChangeSetPayload.toPageChangeSet maps every ChangeSet<Page> field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.PageUserCursor.ChangeSetPayload.toPageChangeSet maps every ChangeSet<Page> field onto the field of the same meaning" passed after 0.019 seconds.
+◇ Test "Components.Schemas.PageUserCursor.ChangeSetPayload.ValuesPayloadPayload.toPage maps every Page field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.PageUserCursor.ChangeSetPayload.ValuesPayloadPayload.toPage maps every Page field onto the field of the same meaning" passed after 0.007 seconds.
+◇ Test "Components.Schemas.PageUserDraftCursor.ChangeSetPayload.toPageDraftChangeSet maps every ChangeSet<Page.Draft> field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.PageUserDraftCursor.ChangeSetPayload.toPageDraftChangeSet maps every ChangeSet<Page.Draft> field onto the field of the same meaning" passed after 0.016 seconds.
+◇ Test "Components.Schemas.PageUserDraftCursor.ChangeSetPayload.ValuesPayloadPayload.toPageDraft maps every Page.Draft field onto the field of the same meaning" started.
+✔ Test "Components.Schemas.PageUserDraftCursor.ChangeSetPayload.ValuesPayloadPayload.toPageDraft maps every Page.Draft field onto the field of the same meaning" passed after 0.008 seconds.
+✔ Suite NoteSchemaInverseTests passed after 0.256 seconds.
+◇ Suite NoteSnapshotTests started.
+✔ Suite NoteSnapshotTests passed after 0.001 seconds.
+✔ Test run with 33 tests in 10 suites passed after 1.042 seconds.
+** TEST EXECUTE SUCCEEDED **
+Testing started
