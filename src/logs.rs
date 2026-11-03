@@ -46,6 +46,10 @@ impl LogFile {
         if self.file.write_all(&line).is_ok() {
             self.len += line.len() as u64;
         }
+        // The file is O_APPEND and other handles append too (a remote run's mirror): the end is where this record ended.
+        if let Ok(m) = self.file.metadata() {
+            self.len = m.len();
+        }
         self.len
     }
 }

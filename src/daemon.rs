@@ -25,6 +25,8 @@ const LOG_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 const LOG_BYTES: u64 = 500 * 1024 * 1024;
 /// How often a finished run may trigger `prune`.
 const PRUNE_EVERY_MS: u64 = 60 * 60 * 1000;
+/// The commit this binary was built from (`build.rs`); a `[remote]` takes work only at the same one.
+const VERSION: &str = env!("COLLIE_COMMIT");
 
 fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
@@ -375,7 +377,7 @@ impl Leases {
 
 // ---- processes
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum St {
     Building,
@@ -429,10 +431,19 @@ struct Proc {
     usage: Option<Usage>,
     /// Queued for a build slot (`builds`), not for a device.
     awaits_slot: bool,
+    /// Runs on the `[remote]` as `{"name": <its host>, "id": <its process there>}`, this one mirroring it; `id` is null
+    /// while a queued process is moving there. Null when it runs here.
+    remote: Option<Value>,
     /// Its run phase outlived its kill limit and is being killed; `finish` makes it `timed-out`. Not the state
     /// itself before then, which would count as ended while the process still lives.
     #[serde(skip)]
     timed_out: bool,
+    /// What starts it on the `[remote]` (`forward_request`), when it may go there.
+    #[serde(skip)]
+    forward: Option<Value>,
+    /// It has held a build slot here, so it can no longer move to the remote.
+    #[serde(skip)]
+    slotted: bool,
     #[serde(skip)]
     t: Target,
 }
@@ -640,7 +651,7 @@ fn seat_build_dibs(leases: &mut Leases, slots: &mut Slots, started: impl Fn(u32)
 }
 
 /// Removes matching processes, records the live ones in the history, releases their leases and kills their process
-/// groups.
+/// groups; those on the `[remote]`, ended ones too, are stopped there.
 async fn stop_where(d: &D, pred: impl Fn(&Proc) -> bool) -> Vec<String> {
     let gone: Vec<Proc> = {
         let mut st = d.lock();
@@ -665,6 +676,25 @@ async fn stop_where(d: &D, pred: impl Fn(&Proc) -> bool) -> Vec<String> {
     for p in &gone {
         if let Some(pid) = p.pid {
             kill_group(pid).await;
+        }
+    }
+    // Not yet there (no id): `start_remote` stops it once it is. Spawned: a sleeping remote mustn't hold up a restart.
+    // Awaited while the daemon stops: it ends the ssh forward and drops its tasks right after, stranding them there.
+    let there: Vec<(&Proc, String)> = gone.iter().filter_map(|p| Some((p, p.remote.as_ref()?["id"].as_str()?.to_string()))).collect();
+    if !there.is_empty()
+        && let Some(r) = builds::remote(&builds::config_path())
+    {
+        let stops: Vec<_> = there
+            .into_iter()
+            .map(|(p, rid)| {
+                let (d, r, t, holder) = (d.clone(), r.clone(), p.t.clone(), p.holder.clone());
+                tokio::spawn(async move { remote_stop(&d, &r, &t, &holder, &rid).await })
+            })
+            .collect();
+        if d.lock().stopping {
+            for s in stops {
+                let _ = s.await;
+            }
         }
     }
     gone.into_iter().map(|p| p.id).collect()
@@ -870,6 +900,9 @@ async fn prepare(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, dir: 
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-c", &prep.cmd]).current_dir(&root);
     let status = exec(d, id, log, e, cmd, env, None, St::Building).await;
+    if status.is_none() && moved(d, id) {
+        return Err(None);
+    }
     if !status.is_some_and(|s| s.success()) {
         say(Level::Error, "collie: prepare failed; the build didn't start".into());
         return Err(status);
@@ -882,7 +915,8 @@ async fn prepare(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, dir: 
 struct Slot(D, String);
 
 impl Slot {
-    /// Queues `id` for a slot and waits its turn (state `queued`, `awaits_slot`); None when it was stopped meanwhile.
+    /// Queues `id` for a slot and waits its turn (state `queued`, `awaits_slot`); None when it was stopped meanwhile,
+    /// or moved to the remote (`moved`).
     async fn take(d: &D, id: &str) -> Option<Slot> {
         d.lock().slots.queued.push(id.into());
         loop {
@@ -898,9 +932,13 @@ impl Slot {
                         slots.queued.retain(|q| q != id);
                         (Some(None), true)
                     }
+                    // Moved (`watch_remote`): its mirror carries on.
+                    Some(p) if p.remote.as_ref().is_some_and(|r| !r["id"].is_null()) => (Some(None), false),
+                    // Moving: out of the queue meanwhile, so it can't also start here; put back if the move fails.
+                    Some(p) if p.remote.is_some() => (None, false),
                     Some(p) if slots.may_start(id) => {
                         slots.running.push(slots.queued.remove(0));
-                        p.awaits_slot = false;
+                        (p.awaits_slot, p.slotted) = (false, true);
                         (Some(Some(Slot(d.clone(), id.into()))), true)
                     }
                     Some(p) if !p.awaits_slot => {
@@ -1078,6 +1116,10 @@ async fn lifecycle(
     if t.kind != "exec"
         && let Err(status) = prepare(&d, &id, &log, e, &t.dir, &env).await
     {
+        // Moved to the remote while its prepare waited for a slot: the mirror ends it.
+        if moved(&d, &id) {
+            return;
+        }
         save_problems(&d, &id, &t, true).await;
         return finish(&d, &id, status);
     }
@@ -1090,6 +1132,9 @@ async fn lifecycle(
     let builds = build.is_some();
     if let Some(cmd) = build {
         let status = exec(&d, &id, &log, e, cmd, &env, port, St::Building).await;
+        if status.is_none() && moved(&d, &id) {
+            return;
+        }
         if !status.is_some_and(|s| s.success()) {
             save_problems(&d, &id, &t, true).await;
             return finish(&d, &id, status);
@@ -1156,6 +1201,10 @@ async fn lifecycle(
     let _ = ended.send(());
     if let Some(g) = guard {
         let _ = g.await;
+    }
+    // Only now, with the guard told and done: an exec that moved while it waited for its slot.
+    if status.is_none() && moved(&d, &id) {
+        return;
     }
     if let Some(limit) = limit.filter(|_| d.lock().procs.iter().any(|p| p.id == id && p.timed_out)) {
         let line = format!("collie: killed: its run phase outlived its kill limit of {} ms (`--timeout`); a simulator it ran on is replaced", limit.as_millis());
@@ -2296,6 +2345,102 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
     let pf = || e.platform().ok_or_else(|| coded("bad_request", format!("{name}: {} targets have no devices", t.ecosystem)));
     // Before any lease is taken, so a kind that isn't installed fails without side effects.
     let dev = eco::caller_developer_dir(&t.dir, &env);
+    // Stored only for a target that runs on a simulator; an exec's or task's `--sim` has the run's flags alone.
+    let choice = match needs.contains(&Resource::Simulator) {
+        true => {
+            let (path, st) = (d.dir.join("sims.json"), t.clone());
+            tokio::task::spawn_blocking(move || stored(&path, &st).1).await?
+        }
+        false => Value::Null,
+    };
+    let same = |p: &Proc| p.t.dir == t.dir && p.t.name == t.name;
+    let refuse = |st: &State| -> Result<()> {
+        ensure!(!st.stopping, coded("stopping", "the daemon is stopping"));
+        if let (Some(p), false) = (st.procs.iter().find(|p| same(p) && p.holder != holder && !p.ended()), take) {
+            bail!(coded("held", format!("{name} is held by {}; pass --take to take it over", who(&p.holder, &p.agent))));
+        }
+        Ok(())
+    };
+    let (forward, offload, mut warn) = offload_plan(d, &t, holder, p, &choice)?;
+    let now = now_ms();
+    let id = format!("{}-{now}", t.name.replace('/', "_"));
+    let agent = agent_name(holder).await;
+    let bdir = t.dir.clone();
+    let branch = tokio::task::spawn_blocking(move || git(&bdir, &["branch", "--show-current"])).await.ok().flatten();
+    let mut base = Proc {
+        id: id.clone(),
+        target: t.name.clone(),
+        kind: t.kind.clone(),
+        dir: t.dir.clone(),
+        state: St::Building,
+        code: None,
+        signal: None,
+        pid: None,
+        holder: holder.into(),
+        agent: agent.clone(),
+        leases: vec![],
+        port: None,
+        simulator: None,
+        device: None,
+        since: now,
+        ended_at: None,
+        built: false,
+        launched: false,
+        blocked: false,
+        tests: None,
+        only: !only.is_empty(),
+        branch,
+        problems: None,
+        usage: None,
+        awaits_slot: false,
+        remote: None,
+        timed_out: false,
+        forward,
+        slotted: false,
+        t: t.clone(),
+    };
+    // Synced and started there before replying, so a failure before the remote process exists runs it here instead,
+    // as if it never left: same id and log, with the reason in it.
+    if let Some(rname) = offload {
+        let mut log = LogFile::open(&d.log_path(&id))?;
+        let claimed = {
+            let mut st = d.lock();
+            refuse(&st).map(|()| st.procs.push(Proc { state: St::Queued, remote: Some(json!({"name": rname, "id": null})), ..base.clone() }))
+        };
+        if let Err(e) = claimed {
+            let _ = std::fs::remove_file(d.log_path(&id));
+            return Err(e);
+        }
+        d.changed();
+        stop_where(d, |p| same(p) && p.id != id).await;
+        let why = if p["offload"] == "always" { "--remote" } else { "local build slots full" };
+        log.append(&Record { ts: now_ms(), source: Source::Build, level: Level::Info, line: format!("collie: runs on {rname} ({why})") });
+        match start_remote(d, &id).await {
+            Ok(rid) => {
+                let v = d.lock().procs.iter().find(|p| p.id == id).map(|p| json!(p));
+                tokio::spawn(mirror(d.clone(), id.clone(), Some(rid), Mutex::new(log)));
+                return v.ok_or_else(|| coded("stopped", format!("{name} was stopped while starting")));
+            }
+            Err(x) => {
+                let had = {
+                    let mut st = d.lock();
+                    let had = st.procs.iter().any(|p| p.id == id);
+                    st.procs.retain(|p| p.id != id);
+                    had
+                };
+                d.changed();
+                // Stopped meanwhile (`stop_where` recorded it), or `--remote`, which runs there or not at all.
+                if !had || p["offload"] == "always" {
+                    if had {
+                        let _ = std::fs::remove_file(d.log_path(&id));
+                    }
+                    return Err(x);
+                }
+                warn = Some(format!("collie: couldn't run on {rname}: {x:#}; runs here"));
+                base.forward = None;
+            }
+        }
+    }
     let (kind, phone, head, template) = match (needs.contains(&Resource::Simulator), p["simulator"] == true, p["physical"].as_str()) {
         (true, ..) => destination(d, pf()?, &t, device, runtime, dev.clone()).await?,
         (false, true, _) => {
@@ -2313,15 +2458,7 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
     if kind.is_none() && phone.is_none() {
         with_udid(args.clone(), None)?;
     }
-    // Stored only for a target that runs on a simulator; an exec's or task's `--sim` has the run's flag alone.
-    let stored = match needs.contains(&Resource::Simulator) {
-        true => {
-            let (path, st) = (d.dir.join("sims.json"), t.clone());
-            tokio::task::spawn_blocking(move || stored(&path, &st).1["slim"].clone()).await?
-        }
-        false => Value::Null,
-    };
-    let slim = slim_for(&p["slim"], &stored, phone.is_some())?;
+    let slim = slim_for(&p["slim"], &choice["slim"], phone.is_some())?;
     if !p["slim"].is_null() && kind.is_none() && phone.is_none() {
         bail!(coded("bad_request", "--slim and --stock are for a simulator: an iOS target's, or --sim's"));
     }
@@ -2330,24 +2467,16 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
         tokio::task::spawn_blocking(move || check_slim(pf, &except)).await??;
     }
     let queue = p["queue"] == true;
-    let same = |p: &Proc| p.t.dir == t.dir && p.t.name == t.name;
-    let now = now_ms();
-    let id = format!("{}-{now}", t.name.replace('/', "_"));
     let mut log = LogFile::open(&d.log_path(&id))?;
-    let agent = agent_name(holder).await;
-    let bdir = t.dir.clone();
-    let branch = tokio::task::spawn_blocking(move || git(&bdir, &["branch", "--show-current"])).await.ok().flatten();
+    if let Some(line) = warn {
+        log.append(&Record { ts: now_ms(), source: Source::Build, level: Level::Warn, line });
+    }
     // The held check, the carry and a placeholder process happen under one lock, so a second run of this target
     // arriving while this one creates its device sees it: another holder gets `held`; the same holder restarts it.
     // A physical device is leased here too, needing no I/O: `busy` then leaves nothing behind, like `held`.
     let claim = {
         let mut st = d.lock();
-        let p = st.procs.iter().find(|p| same(p) && p.holder != holder && !p.ended());
-        if st.stopping {
-            Err(coded("stopping", "the daemon is stopping"))
-        } else if let (Some(p), false) = (p, take) {
-            Err(coded("held", format!("{name} is held by {}; pass --take to take it over", who(&p.holder, &p.agent))))
-        } else {
+        refuse(&st).and_then(|()| {
             let kept = match (&kind, &phone) {
                 (Some(k), _) => Ok((carry(&mut st, sim_source(&t, holder), sim_fits(k, &slim)), None)),
                 (None, Some(dev)) => claim_device(&mut st, same, holder, agent.clone(), take, dev, &name, queue.then_some(id.as_str())),
@@ -2355,37 +2484,14 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
             };
             kept.inspect(|(kept, queued)| {
                 st.procs.push(Proc {
-                    id: id.clone(),
-                    target: t.name.clone(),
-                    kind: t.kind.clone(),
-                    dir: t.dir.clone(),
-                    state: St::Building,
-                    code: None,
-                    signal: None,
-                    pid: None,
-                    holder: holder.into(),
-                    agent: agent.clone(),
                     leases: kept.iter().map(|l| l.id).collect(),
-                    port: None,
                     simulator: kept.as_ref().and_then(|l| l.simulator.clone()),
                     // A queued run shows the device it waits for.
                     device: kept.as_ref().and_then(|l| l.device.clone()).or(queued.as_ref().and(phone.clone())),
-                    since: now,
-                    ended_at: None,
-                    built: false,
-                    launched: false,
-                    blocked: false,
-                    tests: None,
-                    only: !only.is_empty(),
-                    branch: branch.clone(),
-                    problems: None,
-                    usage: None,
-                    awaits_slot: false,
-                    timed_out: false,
-                    t: t.clone(),
+                    ..base.clone()
                 })
             })
-        }
+        })
     };
     let (kept, queued) = match claim {
         Ok(claimed) => claimed,
@@ -2505,6 +2611,10 @@ async fn wait(d: &D, cwd: &Path, target: Option<&str>, holder: &str, until: &str
             let last = last.map_or("—".to_string(), |r| r.line.lines().next().unwrap_or_default().chars().take(160).collect());
             let state = json!(p.state);
             let elapsed = crate::tui::ago(now_ms().saturating_sub(p.since));
+            if let Some(r) = &p.remote {
+                let on = r["name"].as_str().unwrap_or("remote");
+                bail!(coded("timeout", format!("{id} still {} on {on} ({elapsed} elapsed, last: {last}); it keeps running: wait again", state.as_str().unwrap_or_default())));
+            }
             if p.awaits_slot {
                 let st = d.lock();
                 let why = format!("{} of {} build slots busy: {}", st.slots.running.len(), st.slots.cap, slot_holders(&st).join(", "));
@@ -2941,7 +3051,7 @@ async fn call(d: &D, method: &str, p: &Value) -> Result<Value> {
                 bail!(coded("bad_request", "exec needs a command: collie exec -- <cmd> [args…]"));
             }
             let name = p["name"].as_str().map_or_else(|| args.iter().take(2).cloned().collect::<Vec<_>>().join(" "), Into::into);
-            let t = Target { name, ecosystem: "task".into(), dir: cwd, kind: "exec".into(), package: None, needs_port: false, port: None, target_dir: None };
+            let t = Target { name, ecosystem: "task".into(), dir: cwd, kind: "exec".into(), package: None, needs_port: false, port: None, target_dir: None, offload: None };
             run_target(d, t, holder, p).await
         }
         "stop" => {
@@ -3036,6 +3146,8 @@ async fn call(d: &D, method: &str, p: &Value) -> Result<Value> {
             let s = d.snapshot();
             Ok(json!({"leases": s["leases"], "queue": s["queue"]}))
         }
+        // From another daemon's `watch_remote`; no CLI.
+        "prune.dir" => prune_dir(d, Path::new(p["path"].as_str().context("missing path")?), &home().join("Library/Developer/Xcode/DerivedData")).await,
         "daemon.stop" => {
             // A run either claimed before this (and is stopped here) or sees the flag.
             d.lock().stopping = true;
@@ -3058,23 +3170,773 @@ async fn conn(d: D, s: UnixStream) {
             "logs" if p["follow"] == true => follow(&d, p, &cwd, holder, &mut w).await,
             _ => call(&d, m, p).await,
         };
-        // `built` lets a client tell it talks to an older daemon than itself.
+        // `built` lets a client tell it talks to an older daemon than itself; `version`, another daemon that it runs
+        // another commit.
         let frame = match res {
-            Ok(r) => json!({"id": id, "result": r, "built": d.built}),
+            Ok(r) => json!({"id": id, "result": r, "built": d.built, "version": VERSION}),
             Err(e) => {
                 let code = e.downcast_ref::<Coded>().map_or("error", |c| &c.0);
-                json!({"id": id, "error": {"code": code, "message": format!("{e:#}")}, "built": d.built})
+                json!({"id": id, "error": {"code": code, "message": format!("{e:#}")}, "built": d.built, "version": VERSION})
             }
         };
         if send(&mut w, &frame).await.is_err() {
             return;
         }
         if m == "daemon.stop" {
+            end_forward();
             // Unlinked first, so no new client reaches this daemon during the drain and starts a process it would orphan.
             let _ = std::fs::remove_file(socket_path());
             drain_retirements(&d).await;
             std::process::exit(0);
         }
+    }
+}
+
+// ---- remote
+
+/// How long a forwarded `run`/`exec` may take to answer: the remote creates (and maybe slims) a simulator first.
+const FORWARD_LIMIT: Duration = Duration::from_secs(600);
+
+/// The ssh forward's pid (0: none), killed on the way out: `daemon.stop` exits without dropping it.
+static FORWARD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// One lock per worktree here, held while its copy there is synced or deleted, so the two never overlap.
+static COPIES: Mutex<std::collections::BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The file `sync` puts in each copy it makes: a dir without it is no copy of collie's, never synced over or deleted.
+const MARKER: &str = ".collie-copy";
+
+/// rsync's ssh: fails fast on a host that's off, and drops a connection that stalls.
+const SSH: &str = "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3";
+
+/// Guards the copy ledger, `remote.json`.
+static LEDGER: Mutex<()> = Mutex::new(());
+
+/// This machine's short host name: a remote's processes are held by `<holder>@<it>`.
+fn hostname() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let out = std::process::Command::new("hostname").arg("-s").output().ok();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "localhost".into())
+    })
+}
+
+/// Whether a run of `t` with `run`'s params `p` may go to the `[remote]` (`choice`: its stored simulator choice):
+/// test and build targets, and tasks and named execs whose name's action is `test`, `lint` or `typecheck` (the word,
+/// or `<word>-…`); with `offload: "always"` (`--remote`) or a task's `offload = true`, any task or exec. Never with
+/// `offload = false` or `offload: "never"` (`--local`), a port, `--sim`/`--physical`, or a stored physical device the
+/// run doesn't trade for a simulator (`--device`/`--runtime`).
+fn offloadable(t: &Target, p: &Value, choice: &Value) -> bool {
+    let action = |name: &str| ["test", "lint", "typecheck"].iter().any(|a| name == *a || name.starts_with(&format!("{a}-")));
+    let always = p["offload"] == "always";
+    let never = p["offload"] == "never" || t.offload == Some(false) || t.needs_port || t.port.is_some() || p["simulator"] == true || p["physical"].is_string();
+    let physical = choice["physical"].is_string() && p["device"].is_null() && p["runtime"].is_null();
+    let fits = match t.kind.as_str() {
+        "test" | "build" => true,
+        "task" => always || t.offload == Some(true) || action(&t.name),
+        // The default name (the command's first two words, `cargo test`) is no action.
+        "exec" => always || p["name"].is_string() && action(&t.name),
+        _ => false,
+    };
+    fits && !never && !physical
+}
+
+/// The caller's env as the remote gets it: without what describes this machine (user, shell, temp dir, toolchain, ssh
+/// agent, terminal, herdr pane, collie's state) or points under this `home` outside the mapped `prefixes`. The remote
+/// daemon's own env (a login shell's) fills those in.
+fn forward_env(env: &HashMap<String, String>, home: &Path, prefixes: &[&str]) -> HashMap<String, String> {
+    const DROP: [&str; 11] = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "OLDPWD", "DEVELOPER_DIR", "TERM_SESSION_ID", "COLLIE_STATE_DIR"];
+    const DROP_PREFIXED: [&str; 4] = ["SSH_", "XPC_", "__CF", "HERDR_"];
+    let here = |v: &str| v.split(':').map(Path::new).any(|p| !home.as_os_str().is_empty() && p.starts_with(home) && !prefixes.iter().any(|x| p.starts_with(x)));
+    let keep = |(k, v): &(&String, &String)| !DROP.contains(&k.as_str()) && !DROP_PREFIXED.iter().any(|x| k.starts_with(x)) && !here(v);
+    env.iter().filter(keep).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// The request (`{"method", "params"}`, paths not yet mapped) that starts `t` on the remote as `run`'s params `p` start
+/// it here: held by `<holder>@<this host>`, never offloaded again (`offload: "never"`), with the env `forward_env`
+/// keeps (`home`, `prefixes`: this side of `[remote] paths`), and for a simulator target the kind and slim setting
+/// stored here (`choice`) unless the run picks its own.
+fn forward_request(t: &Target, p: &Value, holder: &str, choice: &Value, home: &Path, prefixes: &[&str]) -> Value {
+    let env: HashMap<String, String> = serde_json::from_value(p["env"].clone()).unwrap_or_default();
+    let mut q = p.clone();
+    (q["holder"], q["env"], q["offload"]) = (format!("{holder}@{}", hostname()).into(), json!(forward_env(&env, home, prefixes)), "never".into());
+    for k in ["device", "runtime", "slim"].into_iter().filter(|_| choice.is_object()) {
+        if q[k].is_null() {
+            q[k] = choice[k].clone();
+        }
+    }
+    let method = match t.kind.as_str() {
+        "exec" => "exec",
+        _ => {
+            q["target"] = t.name.clone().into();
+            "run"
+        }
+    };
+    json!({"method": method, "params": q})
+}
+
+/// `text` with each path under a `paths` prefix (here → there; with `back`, there → here) rewritten, the longest prefix
+/// first, matching whole path components only: `/a/b` rewrites `/a/b` and `/a/b/c`, never `/a/bc` or `/x/a/b`.
+fn map_paths(text: &str, paths: &std::collections::BTreeMap<String, String>, back: bool) -> String {
+    let trim = |s: &str| s.trim_end_matches('/').to_string();
+    let mut pairs: Vec<(String, String)> = paths.iter().map(|(a, b)| if back { (trim(b), trim(a)) } else { (trim(a), trim(b)) }).filter(|(from, _)| !from.is_empty()).collect();
+    pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    let name = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.');
+    let (mut out, mut i) = (String::with_capacity(text.len()), 0);
+    while let Some(c) = text[i..].chars().next() {
+        let starts = text[..i].chars().next_back().is_none_or(|b| !name(b));
+        let ends = |from: &str| text[i + from.len()..].chars().next().is_none_or(|n| n == '/' || !name(n));
+        match pairs.iter().find(|(from, _)| starts && text[i..].starts_with(from.as_str()) && ends(from)) {
+            Some((from, to)) => {
+                out.push_str(to);
+                i += from.len();
+            }
+            None => {
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// Whether `dir` may be synced over or deleted on the remote: absolute and normalised, below the top level, not a home
+/// dir, and (given the remote side of `[remote] paths`) strictly inside one of `prefixes`.
+fn safe_dir(dir: &Path, prefixes: Option<&[PathBuf]>) -> bool {
+    use std::path::Component;
+    let normal = dir.components().skip(1).all(|c| matches!(c, Component::Normal(_)));
+    let a_home = dir.parent().is_some_and(|p| p == Path::new("/Users") || p == Path::new("/home")) || dir == home();
+    let inside = prefixes.is_none_or(|ps| ps.iter().any(|p| dir.starts_with(p) && dir != p));
+    dir.is_absolute() && normal && dir.components().count() > 2 && !a_home && inside
+}
+
+/// The exit a remote process ended with, from its `code` or `signal`; None when it has neither (it never ran).
+fn exit_status(code: Option<i64>, signal: Option<i64>) -> Option<ExitStatus> {
+    use std::os::unix::process::ExitStatusExt;
+    match (code, signal) {
+        (Some(c), _) => Some(ExitStatus::from_raw((c as i32 & 0xff) << 8)),
+        (None, Some(s)) => Some(ExitStatus::from_raw(s as i32 & 0x7f)),
+        (None, None) => None,
+    }
+}
+
+/// The process `watch_remote` moves to the idle remote: the first in `queued` (queue order, so priority first) that may
+/// go (`forward`), isn't a build dib, holds no leases (an Xcode test with its simulator here waits here) and still
+/// waits for its first slot.
+fn pick_move(queued: &[String], procs: &[Proc]) -> Option<String> {
+    let movable = |q: &String| procs.iter().any(|p| p.id == *q && p.forward.is_some() && p.remote.is_none() && p.leases.is_empty() && !p.slotted);
+    queued.iter().filter(|q| !q.starts_with("dibs:")).find(|q| movable(q)).cloned()
+}
+
+/// The ledger's copies (`remote.json`) to delete on the remote, as (worktree here, copy there): their worktree is
+/// `gone` (NotFound, never just unreadable) and their copy is still a `safe_dir` inside one of `prefixes`, so a
+/// changed mapping or a passing error deletes nothing.
+fn stale_copies(ledger: &Value, prefixes: &[PathBuf], gone: impl Fn(&Path) -> bool) -> Vec<(String, String)> {
+    let stale = |(root, e): (&String, &Value)| {
+        let path = e["path"].as_str()?;
+        (gone(Path::new(root)) && safe_dir(Path::new(path), Some(prefixes))).then(|| (root.clone(), path.to_string()))
+    };
+    ledger.as_object().into_iter().flatten().filter_map(stale).collect()
+}
+
+/// Changes the copy ledger, `remote.json` in the state dir: `{<worktree here>: {"path": <its copy there>, "synced_at":
+/// ms}}`; written only when `f` changed it.
+fn ledger(dir: &Path, f: impl FnOnce(&mut Value)) {
+    let _g = LEDGER.lock().unwrap();
+    let path = dir.join("remote.json");
+    let mut l: Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| json!({}));
+    let before = l.clone();
+    f(&mut l);
+    if l != before {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, l.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Where `r`'s daemon answers here: the ssh forward's end in the state dir, or without a `host`, its socket itself.
+fn remote_sock(d: &D, r: &builds::Remote) -> PathBuf {
+    match r.host {
+        Some(_) => d.dir.join("remote.sock"),
+        None => PathBuf::from(&r.socket),
+    }
+}
+
+/// One request to the daemon at `sock`: its reply frame (`result`, `version`), its error with its code, or an error
+/// when nothing answers. Coded errors only when the request surely didn't run there: its daemon refused it, or
+/// nothing took the connection (`unreachable`). Otherwise (no answer in time, EOF: the ssh forward accepts connections
+/// whether or not a daemon listens behind it) it may have.
+async fn remote_call(sock: &Path, method: &str, params: &Value, limit: Duration) -> Result<Value> {
+    let call = async {
+        let s = UnixStream::connect(sock).await.map_err(|e| coded("unreachable", format!("connecting to {}: {e}", sock.display())))?;
+        let (r, mut w) = s.into_split();
+        send(&mut w, &json!({"id": 1, "method": method, "params": params})).await?;
+        let line = BufReader::new(r).lines().next_line().await?.context("its daemon doesn't answer")?;
+        let v: Value = serde_json::from_str(&line)?;
+        match v.get("error") {
+            Some(e) => Err(coded(e["code"].as_str().unwrap_or("error"), e["message"].as_str().unwrap_or_default())),
+            None => Ok(v),
+        }
+    };
+    tokio::time::timeout(limit, call).await.map_err(|_| anyhow::anyhow!("no answer within {} ms", limit.as_millis()))?
+}
+
+/// Ids of the processes `r`'s `status` lists of target `name` in `dir` held by `holder` (all as named there), oldest
+/// first.
+async fn remote_procs(sock: &Path, name: &str, dir: &str, holder: &str) -> Result<Vec<String>> {
+    let v = remote_call(sock, "status", &json!({}), Duration::from_secs(5)).await?;
+    let ours = |p: &&Value| p["target"] == name && p["dir"] == dir && p["holder"] == holder;
+    Ok(v["result"]["processes"].as_array().into_iter().flatten().filter(ours).filter_map(|p| p["id"].as_str().map(String::from)).collect())
+}
+
+/// Stops remote process `rid`, `holder`'s run of `t` there, ended or not (which releases a simulator it kept there).
+/// Only while that remote's `status` lists it in the copy of `t`'s dir: `stop` goes by name, narrowed to that dir
+/// only when something of that name runs in it, so otherwise it would stop others' processes there. Best effort: one
+/// out of reach is logged in the daemon's log.
+async fn remote_stop(d: &D, r: &builds::Remote, t: &Target, holder: &str, rid: &str) {
+    let (sock, holder) = (remote_sock(d, r), format!("{holder}@{}", hostname()));
+    let (name, cwd) = (map_paths(&t.name, &r.paths, false), map_paths(&t.dir.to_string_lossy(), &r.paths, false));
+    let stop = async {
+        if remote_procs(&sock, &name, &cwd, &holder).await?.iter().any(|x| x == rid) {
+            remote_call(&sock, "stop", &json!({"target": name, "cwd": cwd, "holder": holder}), Duration::from_secs(5)).await?;
+        }
+        anyhow::Ok(())
+    };
+    if let Err(e) = stop.await {
+        eprintln!("collie: couldn't stop {} on {}: {e:#}", t.name, r.name());
+    }
+}
+
+/// rsync protect rules (`P`) for what worktree `root`'s `.gitignore` files ignore. openrsync, macOS's rsync, deletes
+/// what a dir-merge filter excludes (rsync spares it), so `--delete` would take the copy's build output (`target/`,
+/// generated projects) on every sync. Broader than git where unsure (an unanchored pattern protects at any depth):
+/// protecting too much only leaves stale ignored files there.
+fn protect_rules(root: &Path) -> Vec<String> {
+    let files = git(root, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).unwrap_or_default();
+    let mut rules = vec![];
+    for f in files.split('\0').filter(|f| *f == ".gitignore" || f.ends_with("/.gitignore")) {
+        let dir = &f[..f.len() - ".gitignore".len()];
+        let text = std::fs::read_to_string(root.join(f)).unwrap_or_default();
+        for l in text.lines().map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!')) {
+            rules.push(l.strip_prefix('/').map_or_else(|| l.to_string(), |rest| format!("/{dir}{rest}")));
+        }
+    }
+    rules.sort();
+    rules.dedup();
+    rules
+}
+
+/// The lock `sync` and the copy's deletion take for worktree `root`.
+fn copy_lock(root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    COPIES.lock().unwrap().entry(root.to_path_buf()).or_default().clone()
+}
+
+/// Whether `dest` may become (or stay) a copy: not a git checkout, and missing, empty or marked as one (`MARKER`).
+/// The same test as `sync`'s shell test on a host.
+fn copy_dest_ok(dest: &Path) -> bool {
+    let empty = || std::fs::read_dir(dest).is_ok_and(|mut d| d.next().is_none());
+    !dest.join(".git").exists() && (!dest.exists() || dest.join(MARKER).exists() || empty())
+}
+
+/// Copies worktree `root` to `dest` on `r`'s host (on this machine without one): what git tracks and what it doesn't
+/// ignore, never `.git`; files gone here go there too, but what it ignores there (build output) stays. Refuses a
+/// `dest` that `copy_dest_ok` refuses, which marks the copies it makes. Recorded in the ledger first, so even a copy
+/// cut short is cleaned up. Code `sync_failed` when rsync fails or stalls.
+async fn sync(dir: &Path, r: &builds::Remote, root: &Path, dest: &Path) -> Result<()> {
+    let lock = copy_lock(root);
+    let _g = lock.lock().await;
+    let refused = || coded("sync_failed", format!("{} is no copy of collie's (a git checkout, or a dir that isn't empty); map [remote] paths to a dir only collie uses", dest.display()));
+    ensure!(r.host.is_some() || copy_dest_ok(dest), refused());
+    ledger(dir, |l| l[root.to_string_lossy().as_ref()] = json!({"path": dest, "synced_at": now_ms()}));
+    let r2 = root.to_path_buf();
+    let protect = tokio::task::spawn_blocking(move || protect_rules(&r2)).await?;
+    let mut cmd = tokio::process::Command::new("rsync");
+    cmd.args(["-a", "--delete", "--timeout=60", "--exclude=.git", "--filter=:- .gitignore"]).arg(format!("--filter=P /{MARKER}"));
+    cmd.args(protect.iter().map(|p| format!("--filter=P {p}"))).arg(format!("{}/", root.display()));
+    match &r.host {
+        Some(h) => {
+            // `copy_dest_ok`, then the marker, in the shell `--rsync-path` runs in there; it also makes the dir, as
+            // openrsync lacks `--mkpath`.
+            let q = format!("'{}'", dest.to_string_lossy().replace('\'', r"'\''"));
+            let check = format!("if [ -e {q}/.git ] || {{ [ -e {q} ] && [ ! -e {q}/{MARKER} ] && [ -n \"$(ls -A {q})\" ]; }}; then echo 'collie: no copy of collie there (a git checkout, or a dir that is not empty)' >&2; exit 1; fi");
+            cmd.args(["-e", SSH]).arg(format!("--rsync-path={check}; mkdir -p {q} && touch {q}/{MARKER} && rsync")).arg(format!("{h}:{}/", dest.display()));
+        }
+        None => {
+            std::fs::create_dir_all(dest)?;
+            std::fs::write(dest.join(MARKER), "")?;
+            cmd.arg(format!("{}/", dest.display()));
+        }
+    }
+    let out = cmd.stdin(Stdio::null()).kill_on_drop(true).output().await.context("rsync")?;
+    ensure!(out.status.success(), coded("sync_failed", format!("rsync to {}: {}", dest.display(), String::from_utf8_lossy(&out.stderr).trim())));
+    Ok(())
+}
+
+/// Whether a run goes to the `[remote]`: the request that starts it there when it may (`forward_request`), the
+/// remote's name when it goes now (this machine would queue it and the remote is idle, or `--remote`), and a warning
+/// for its log when it would go but the remote takes no work. Errors for `--remote` (`offload: "always"`) when it
+/// can't go.
+fn offload_plan(d: &D, t: &Target, holder: &str, p: &Value, choice: &Value) -> Result<(Option<Value>, Option<String>, Option<String>)> {
+    let always = p["offload"] == "always";
+    let Some(r) = builds::remote(&builds::config_path()) else {
+        ensure!(!always, coded("unavailable", "--remote needs a [remote] in collie's config"));
+        return Ok((None, None, None));
+    };
+    let mapped = r.paths.keys().any(|k| t.dir.starts_with(k));
+    if !mapped || !offloadable(t, p, choice) {
+        ensure!(!always || mapped, coded("bad_request", format!("{} is under no [remote] paths prefix", t.dir.display())));
+        ensure!(!always, coded("bad_request", format!("{} runs here only: apps, servers, devices, --sim and --physical never go to {}", t.name, r.name())));
+        return Ok((None, None, None));
+    }
+    let prefixes: Vec<&str> = r.paths.keys().map(String::as_str).collect();
+    let forward = forward_request(t, p, holder, choice, &home(), &prefixes);
+    let (st, now, name) = (d.lock(), now_ms(), r.name().to_string());
+    let why = || st.slots.remote.as_ref().and_then(|x| x["error"].as_str().map(String::from)).unwrap_or_else(|| "no recent reading of its slots".into());
+    let (go, warn) = match (always, st.slots.would_queue()) {
+        (true, _) if !st.slots.remote_usable(now, VERSION) => bail!(coded("unavailable", format!("{name}: {}", why()))),
+        (true, _) => (true, None),
+        (false, true) if st.slots.remote_idle(now, VERSION, on_the_way(&st.procs)) => (true, None),
+        // Busy there too: it waits here, and moves once a slot there frees up (`watch_remote`).
+        (false, true) if st.slots.remote_usable(now, VERSION) => (false, None),
+        (false, true) => (false, Some(format!("collie: {name} takes no work now ({}); waits for a slot here", why()))),
+        (false, false) => (false, None),
+    };
+    Ok((Some(forward), go.then_some(name), warn))
+}
+
+/// How many processes are on their way to the remote (no id there yet): its reading doesn't count them.
+// ponytail: one that just got its id is missed until the next reading; also count those started since its `at` if
+// bursts still overfill it.
+fn on_the_way(procs: &[Proc]) -> usize {
+    procs.iter().filter(|p| p.remote.as_ref().is_some_and(|r| r["id"].is_null())).count()
+}
+
+/// Whether process `id` moved to the remote while it waited for a slot (`watch_remote`): its mirror ends it, not
+/// `lifecycle`.
+fn moved(d: &D, id: &str) -> bool {
+    d.lock().procs.iter().any(|p| p.id == id && p.remote.as_ref().is_some_and(|r| !r["id"].is_null()))
+}
+
+/// Copies process `id`'s worktree to the remote and starts it there with its `forward` request; the remote process's
+/// id once it exists there (then `remote.id` is set), else why not. When the request may have started it there
+/// without an answer saying so (no answer in time, the connection dropped), it adopts the process the remote's
+/// `status` then lists for it, if any. A process stopped meanwhile gets `stopped`, and is stopped there too.
+async fn start_remote(d: &D, id: &str) -> Result<String> {
+    let r = builds::remote(&builds::config_path()).ok_or_else(|| coded("unavailable", "no [remote] in collie's config"))?;
+    let stopped = || coded("stopped", format!("{id} was stopped while it moved"));
+    let (t, holder, fwd) = {
+        let st = d.lock();
+        let p = st.procs.iter().find(|p| p.id == id).ok_or_else(stopped)?;
+        (p.t.clone(), p.holder.clone(), p.forward.clone().context("it may not leave this machine")?)
+    };
+    let dir = t.dir.clone();
+    let root = tokio::task::spawn_blocking(move || worktree(&dir)).await?;
+    let dest = PathBuf::from(map_paths(&root.to_string_lossy(), &r.paths, false));
+    let prefixes: Vec<PathBuf> = r.paths.values().map(PathBuf::from).collect();
+    ensure!(r.paths.keys().any(|k| root.starts_with(k)), "its worktree {} is under no [remote] paths prefix", root.display());
+    ensure!(safe_dir(&dest, Some(&prefixes)), "{} is no dir collie syncs over", dest.display());
+    sync(&d.dir, &r, &root, &dest).await?;
+    ensure!(d.lock().procs.iter().any(|p| p.id == id), stopped());
+    let req: Value = serde_json::from_str(&map_paths(&fwd.to_string(), &r.paths, false))?;
+    let sock = remote_sock(d, &r);
+    let (name, cwd, at) = (map_paths(&t.name, &r.paths, false), map_paths(&t.dir.to_string_lossy(), &r.paths, false), format!("{holder}@{}", hostname()));
+    // Its processes there before: an earlier run's, ended, is no proof this one started. Unreachable: it can't start.
+    let before = remote_procs(&sock, &name, &cwd, &at).await?;
+    let answer = remote_call(&sock, req["method"].as_str().unwrap_or_default(), &req["params"], FORWARD_LIMIT).await;
+    let said = answer.as_ref().ok().and_then(|v| v["result"]["id"].as_str().map(String::from));
+    let rid = match (said, answer) {
+        (Some(rid), _) => rid,
+        // Refused there: it never started.
+        (None, Err(e)) if e.downcast_ref::<Coded>().is_some() => return Err(e),
+        (None, answer) => {
+            let why = answer.err().map_or("its reply names no process".into(), |e| format!("{e:#}"));
+            let started = remote_procs(&sock, &name, &cwd, &at).await.unwrap_or_default().into_iter().rfind(|x| !before.contains(x));
+            started.with_context(|| format!("{why}, and it doesn't run there"))?
+        }
+    };
+    // Only now: a moving process must not count as moved before the remote has it.
+    let here = d.lock().procs.iter_mut().find(|p| p.id == id).map(|p| p.remote = Some(json!({"name": r.name(), "id": rid}))).is_some();
+    if !here {
+        remote_stop(d, &r, &t, &holder, &rid).await;
+        bail!(stopped());
+    }
+    d.changed();
+    Ok(rid)
+}
+
+/// Copies remote process `rp` (as the remote's `status` shows it) into proxy `id`: what it shows while it runs. Its
+/// end (state, code, signal) waits for `finish`, which comes after its test results are written. False once `id` is
+/// gone here.
+fn copy_remote(d: &D, id: &str, rp: &Value) -> bool {
+    let mut st = d.lock();
+    let Some(p) = st.procs.iter_mut().find(|p| p.id == id) else { return false };
+    if let Ok(s) = serde_json::from_value::<St>(rp["state"].clone())
+        && !matches!(s, St::Exited | St::Crashed | St::TimedOut)
+    {
+        p.state = s;
+    }
+    (p.built, p.awaits_slot, p.blocked) = (rp["built"] == true, rp["awaits_slot"] == true, rp["blocked"] == true);
+    p.tests = Some(rp["tests"].clone()).filter(|t| !t.is_null()).or(p.tests.take());
+    p.usage = serde_json::from_value(rp["usage"].clone()).ok();
+    p.simulator = serde_json::from_value(rp["simulator"].clone()).ok();
+    true
+}
+
+/// Appends remote process `rid`'s log records since `cursor` to `id`'s log, with paths mapped back, and moves the
+/// cursor on; `offsets` collects each record's offset there and here, for its test results' cursors.
+#[allow(clippy::too_many_arguments)]
+async fn pull_logs(d: &D, id: &str, sock: &Path, paths: &std::collections::BTreeMap<String, String>, log: &Mutex<LogFile>, cursor: &mut String, offsets: &mut Vec<(u64, u64)>) -> Result<()> {
+    let v = remote_call(sock, "logs", &json!({"since": cursor}), Duration::from_secs(30)).await?;
+    let mut at = logs::parse_cursor(cursor)?.1;
+    for r in v["result"]["records"].as_array().into_iter().flatten() {
+        let Ok(mut rec) = serde_json::from_value::<Record>(r.clone()) else { continue };
+        // Its length in the remote's file, which `LogFile::append` writes as this same serialisation.
+        let len = serde_json::to_vec(&rec).map_or(0, |b| b.len() as u64 + 1);
+        rec.line = map_paths(&rec.line, paths, true);
+        offsets.push((at, log.lock().unwrap().len));
+        emit(d, id, log, rec);
+        at += len;
+    }
+    if let Some(c) = v["result"]["cursor"].as_str() {
+        *cursor = c.into();
+    }
+    Ok(())
+}
+
+/// One connection's worth of `mirror`: subscribes to the remote at `sock` and on each change copies remote process
+/// `rid` into `id` and pulls its new log records (`pull_logs`). Its final state once it ended there (stopped or lost
+/// there: as its history has it); None once `id` is gone here. Err when the connection drops or the pull fails;
+/// `contact` is set once the remote answered, and `failed_pulls` counts the pulls that failed in a row.
+#[allow(clippy::too_many_arguments)]
+async fn follow_remote(d: &D, id: &str, rid: &str, sock: &Path, r: &builds::Remote, log: &Mutex<LogFile>, cursor: &mut String, offsets: &mut Vec<(u64, u64)>, contact: &mut bool, failed_pulls: &mut u32) -> Result<Option<Value>> {
+    let (rd, mut w) = UnixStream::connect(sock).await?.into_split();
+    send(&mut w, &json!({"id": 1, "method": "subscribe", "params": {}})).await?;
+    let mut lines = BufReader::new(rd).lines();
+    // Log records are pulled at most this often, not per line: the file is the source of truth.
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let (mut dirty, mut ended): (bool, Option<Value>) = (false, None);
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let line = line?.context("the remote closed the connection")?;
+                *contact = true;
+                let f: Value = serde_json::from_str(&line).unwrap_or_default();
+                match f["event"].as_str() {
+                    Some("status") => {
+                        let rp = f["data"]["processes"].as_array().and_then(|ps| ps.iter().find(|p| p["id"] == rid)).cloned();
+                        let rp = match rp {
+                            Some(rp) => rp,
+                            // Gone from its live processes: stopped there, or its daemon restarted; its history has the end.
+                            None => {
+                                let runs = remote_call(sock, "history", &json!({}), Duration::from_secs(10)).await?;
+                                let run = runs["result"]["runs"].as_array().and_then(|rs| rs.iter().find(|x| x["id"] == rid)).cloned();
+                                run.unwrap_or_else(|| json!({"state": "crashed", "code": null, "signal": null}))
+                            }
+                        };
+                        if !copy_remote(d, id, &rp) {
+                            return Ok(None);
+                        }
+                        d.changed();
+                        if matches!(rp["state"].as_str(), Some("exited" | "crashed" | "timed-out")) {
+                            ended = Some(rp);
+                        }
+                        dirty = true;
+                    }
+                    Some("log") if f["data"]["process"] == rid => dirty = true,
+                    _ if f.get("error").is_some() => bail!("{}: {}", r.name(), f["error"]["message"]),
+                    _ => {}
+                }
+            }
+            _ = tick.tick(), if dirty => {
+                dirty = false;
+                let pulled = pull_logs(d, id, sock, &r.paths, log, cursor, offsets).await;
+                *failed_pulls = if pulled.is_ok() { 0 } else { *failed_pulls + 1 };
+                match pulled {
+                    // Ended there and its log won't come: it ends here with the records it has.
+                    Err(e) if ended.is_some() && *failed_pulls >= 3 => {
+                        emit(d, id, log, Record { ts: now_ms(), source: Source::Stderr, level: Level::Error, line: format!("collie: couldn't read the rest of its log on {}: {e:#}", r.name()) });
+                        return Ok(ended);
+                    }
+                    Err(_) if ended.is_some() => {
+                        sleep(Duration::from_secs(1)).await;
+                        dirty = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(()) => {}
+                }
+                if let Some(end) = ended.take() {
+                    return Ok(Some(end));
+                }
+                if !d.lock().procs.iter().any(|p| p.id == id) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Mirrors process `id` from its twin on the remote (`rid`) until that ends, then ends `id` the same way: with its
+/// test results, its problems found here in the mirrored log, and its exit. With no `rid` (a queued process
+/// `watch_remote` picked), it is synced and started there first, and put back in the queue here if that fails.
+/// Reconnects after losing the remote, which runs on meanwhile; gives up once `id` is gone here.
+async fn mirror(d: D, id: String, rid: Option<String>, log: Mutex<LogFile>) {
+    let say = |level, line: String| emit(&d, &id, &log, Record { ts: now_ms(), source: Source::Stderr, level, line });
+    let name = || builds::remote(&builds::config_path()).map_or("remote".into(), |r| r.name().to_string());
+    let rid = match rid {
+        Some(rid) => rid,
+        None => {
+            say(Level::Info, format!("collie: moved to {} (local build slots full)", name()));
+            match start_remote(&d, &id).await {
+                Ok(rid) => rid,
+                Err(e) => {
+                    let back = {
+                        let mut st = d.lock();
+                        let State { procs, slots, .. } = &mut *st;
+                        // `forward` cleared: it waits here for good rather than failing the same way every sample.
+                        let p = procs.iter_mut().find(|p| p.id == id).map(|p| (p.remote, p.forward) = (None, None));
+                        p.map(|()| slots.put_back(id.clone())).is_some()
+                    };
+                    if back {
+                        say(Level::Warn, format!("collie: couldn't move to {}: {e:#}; waits for a slot here", name()));
+                        d.changed();
+                    }
+                    return;
+                }
+            }
+        }
+    };
+    let Some(t) = d.lock().procs.iter().find(|p| p.id == id).map(|p| p.t.clone()) else { return };
+    d.lock().writing.insert(id.clone());
+    let (mut cursor, mut offsets, mut lost, mut backoff, mut failed_pulls) = (logs::cursor(&rid, 0), vec![], false, 1, 0);
+    let end = loop {
+        if !d.lock().procs.iter().any(|p| p.id == id) {
+            break None;
+        }
+        let mut contact = false;
+        let followed = match builds::remote(&builds::config_path()) {
+            Some(r) => {
+                let sock = remote_sock(&d, &r);
+                let end = follow_remote(&d, &id, &rid, &sock, &r, &log, &mut cursor, &mut offsets, &mut contact, &mut failed_pulls).await;
+                end.map(|end| end.map(|e| (e, sock, r)))
+            }
+            None => Err(anyhow::anyhow!("no [remote] in collie's config")),
+        };
+        if contact {
+            (lost, backoff) = (false, 1);
+        }
+        match followed {
+            Ok(end) => break end,
+            // It answers but its log can't be read: following it can't work; it ends here as lost.
+            Err(e) if failed_pulls >= 5 => {
+                say(Level::Error, format!("collie: gave up following it on {}: {e:#}", name()));
+                let holder = d.lock().procs.iter().find(|p| p.id == id).map(|p| p.holder.clone());
+                if let (Some(r), Some(holder)) = (builds::remote(&builds::config_path()), holder) {
+                    remote_stop(&d, &r, &t, &holder, &rid).await;
+                }
+                d.lock().writing.remove(&id);
+                finish(&d, &id, None);
+                return;
+            }
+            Err(_) if !lost => {
+                say(Level::Warn, format!("collie: lost contact with {}, retrying", name()));
+                lost = true;
+            }
+            Err(_) => {}
+        }
+        sleep(Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    };
+    d.lock().writing.remove(&id);
+    // Stopped here: `stop_where` recorded it and stopped it there.
+    let Some((end, sock, r)) = end else { return };
+    if t.kind == "test"
+        && let Ok(v) = remote_call(&sock, "tests", &json!({"process": rid}), Duration::from_secs(30)).await
+    {
+        let mut v: Value = serde_json::from_str(&map_paths(&v["result"].to_string(), &r.paths, true)).unwrap_or_default();
+        v["process"] = id.as_str().into();
+        for x in v["tests"].as_array_mut().into_iter().flatten() {
+            x["process"] = id.as_str().into();
+            // A failure's cursor points into the remote's log: the same record's offset in this one.
+            let here = x["failure"]["cursor"].as_str().and_then(|c| logs::parse_cursor(c).ok()).and_then(|(_, off)| offsets.iter().find(|(r, _)| *r == off));
+            if x["failure"].is_object() {
+                x["failure"]["cursor"] = here.map(|(_, h)| logs::cursor(&id, *h)).into();
+            }
+        }
+        if let Err(x) = std::fs::write(d.logs.join(format!("{id}.tests.json")), v.to_string()) {
+            eprintln!("collie: couldn't write {id}'s test results: {x}");
+        }
+        if let Some(p) = d.lock().procs.iter_mut().find(|p| p.id == id).filter(|_| v["totals"].is_object()) {
+            p.tests = Some(v["totals"].clone());
+        }
+    }
+    // As `lifecycle` reads its own: the build's records only, for targets with a build step.
+    save_problems(&d, &id, &t, !matches!(t.ecosystem.as_str(), "node" | "task")).await;
+    if let Some(p) = d.lock().procs.iter_mut().find(|p| p.id == id) {
+        p.timed_out = end["state"] == "timed-out";
+    }
+    finish(&d, &id, exit_status(end["code"].as_i64(), end["signal"].as_i64()));
+}
+
+/// `prune.dir`, from another daemon: deletes `path`, its copy of a worktree it no longer has, with this daemon's ended
+/// processes there (releasing what they kept, a booted simulator included) and the Xcode DerivedData (under
+/// `derived`) built from it. Code `held` while a process runs there, `bad_request` for a path `safe_dir` refuses or
+/// that is no copy `sync` made (no `MARKER`, or a git checkout).
+async fn prune_dir(d: &D, path: &Path, derived: &Path) -> Result<Value> {
+    let copy = !path.exists() || (path.join(MARKER).exists() && !path.join(".git").exists());
+    ensure!(safe_dir(path, None) && copy, coded("bad_request", format!("{} is no dir collie deletes", path.display())));
+    if let Some(p) = d.lock().procs.iter().find(|p| !p.ended() && p.t.dir.starts_with(path)) {
+        bail!(coded("held", format!("{} runs in {}", p.target, path.display())));
+    }
+    stop_where(d, |p| p.ended() && p.t.dir.starts_with(path)).await;
+    let (dir, root) = (path.to_path_buf(), derived.to_path_buf());
+    let derived = tokio::task::spawn_blocking(move || {
+        if let Err(e) = std::fs::remove_dir_all(&dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            bail!("deleting {}: {e}", dir.display());
+        }
+        // collie passes no -derivedDataPath, so builds of the copy sit here (GBs each) and outlive it.
+        let mut gone = vec![];
+        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let out = std::process::Command::new("plutil").args(["-extract", "WorkspacePath", "raw", "-o", "-"]).arg(e.path().join("info.plist")).output();
+            let ws = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            if ws.is_some_and(|w| Path::new(&w).starts_with(&dir)) && std::fs::remove_dir_all(e.path()).is_ok() {
+                gone.push(e.path());
+            }
+        }
+        Ok(gone)
+    });
+    Ok(json!({"pruned": path, "derived_data": derived.await??}))
+}
+
+/// Kills the ssh forward, if one runs.
+fn end_forward() {
+    let pid = FORWARD.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if pid != 0 {
+        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+/// With a `[remote]` in the config (read again each sample, like the `[builds]` knobs): keeps its socket forwarded
+/// over ssh, reads its slots into `builds.remote` every `builds::EVERY_MS`, moves the first eligible queued process
+/// there while it is idle (one a sample), and deletes its copies of worktrees gone here. The one place that talks to
+/// the remote in the background, so the slot sampler never waits on the network.
+async fn watch_remote(d: D) {
+    let path = builds::config_path();
+    let mut ssh: Option<(tokio::process::Child, builds::Remote)> = None;
+    loop {
+        let r = builds::remote(&path);
+        // Restarted when it died or the config changed; none without a host.
+        if let Some((child, was)) = &mut ssh
+            && (r.as_ref() != Some(was) || !matches!(child.try_wait(), Ok(None)))
+        {
+            if let Ok(Some(s)) = child.try_wait() {
+                eprintln!("collie: the ssh forward to {} ended ({s}); restarting it", was.name());
+            }
+            let _ = child.start_kill();
+            ssh = None;
+            FORWARD.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let (None, Some(r), Some(host)) = (&ssh, &r, r.as_ref().and_then(|r| r.host.clone())) {
+            let mut cmd = tokio::process::Command::new("ssh");
+            cmd.args(["-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes", "-o", "ServerAliveInterval=15", "-L"]);
+            cmd.arg(format!("{}:{}", d.dir.join("remote.sock").display(), r.socket)).arg(host).stdin(Stdio::null()).stdout(Stdio::null()).kill_on_drop(true);
+            match cmd.spawn() {
+                Ok(c) => {
+                    FORWARD.store(c.id().unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+                    ssh = Some((c, r.clone()));
+                }
+                Err(e) => eprintln!("collie: couldn't start ssh to {}: {e}", r.name()),
+            }
+        }
+        let Some(r) = r else {
+            if d.lock().slots.remote.take().is_some() {
+                d.changed();
+            }
+            sleep(Duration::from_millis(builds::EVERY_MS)).await;
+            continue;
+        };
+        let sock = remote_sock(&d, &r);
+        let read = remote_call(&sock, "status", &json!({}), Duration::from_secs(3)).await;
+        let now = now_ms();
+        let reading = match &read {
+            Ok(f) => {
+                let b = &f["result"]["builds"];
+                let n = |k: &str| b[k].as_array().map_or(0, Vec::len);
+                let version = f["version"].as_str().unwrap_or("unknown");
+                let error = (version != VERSION || VERSION == "unknown").then(|| format!("version mismatch: {} runs collie {version}, this daemon {VERSION}; build both from the same commit", r.name()));
+                json!({"host": r.name(), "cap": b["cap"], "running": n("running"), "queued": n("queued"), "version": version, "at": now, "error": error})
+            }
+            Err(e) => json!({"host": r.name(), "cap": 0, "running": 0, "queued": 0, "version": null, "at": now, "error": format!("unreachable: {e:#}")}),
+        };
+        let moving = {
+            let mut st = d.lock();
+            let State { procs, slots, .. } = &mut *st;
+            slots.remote = Some(reading);
+            let pending = on_the_way(procs);
+            let id = pick_move(&slots.queued, procs).filter(|_| slots.remote_idle(now, VERSION, pending));
+            if let Some(id) = &id {
+                // Out of the queue first, under this lock: a moving process can't also start here (`Slot::take`).
+                slots.queued.retain(|q| q != id);
+                if let Some(p) = procs.iter_mut().find(|p| p.id == *id) {
+                    p.remote = Some(json!({"name": r.name(), "id": null}));
+                }
+            }
+            id
+        };
+        d.changed();
+        if let Some(id) = moving {
+            match LogFile::open(&d.log_path(&id)) {
+                Ok(log) => _ = tokio::spawn(mirror(d.clone(), id, None, Mutex::new(log))),
+                Err(e) => {
+                    eprintln!("collie: couldn't open {id}'s log: {e}");
+                    let mut st = d.lock();
+                    let State { procs, slots, .. } = &mut *st;
+                    if let Some(p) = procs.iter_mut().find(|p| p.id == id) {
+                        (p.remote, p.forward) = (None, None);
+                        slots.put_back(id);
+                    }
+                    drop(st);
+                    d.changed();
+                }
+            }
+        }
+        if read.is_ok() {
+            let prefixes: Vec<PathBuf> = r.paths.values().map(PathBuf::from).collect();
+            let mut l = Value::Null;
+            ledger(&d.dir, |x| l = x.clone());
+            let gone = |root: &Path| std::fs::metadata(root).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            let stale = tokio::task::spawn_blocking(move || stale_copies(&l, &prefixes, gone)).await.unwrap_or_default();
+            for (root, copy) in stale {
+                // Busy: a sync of a worktree made again at that path, or this copy's deletion from an earlier sample.
+                let Ok(guard) = copy_lock(Path::new(&root)).try_lock_owned() else { continue };
+                let (d, sock, name) = (d.clone(), sock.clone(), r.name().to_string());
+                // Spawned: a deletion (a DerivedData scan included) may take minutes; the readings go on meanwhile.
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    if !gone(Path::new(&root)) {
+                        return;
+                    }
+                    let pruned = remote_call(&sock, "prune.dir", &json!({"path": copy}), Duration::from_secs(120)).await;
+                    match pruned {
+                        // Made again here meanwhile: its next sync records it again.
+                        Ok(_) if !gone(Path::new(&root)) => {}
+                        Ok(_) => ledger(&d.dir, |l| _ = l.as_object_mut().map(|m| m.remove(&root))),
+                        // Something still runs there: next sample.
+                        Err(e) if e.downcast_ref::<Coded>().is_some_and(|c| c.0 == "held") => {}
+                        // No copy of collie's (an older collie's, unmarked, or one it refused to sync over): never deleted.
+                        Err(e) if e.downcast_ref::<Coded>().is_some_and(|c| c.0 == "bad_request") => {
+                            eprintln!("collie: left {copy} on {name}: {e}");
+                            ledger(&d.dir, |l| _ = l.as_object_mut().map(|m| m.remove(&root)));
+                        }
+                        Err(e) => eprintln!("collie: couldn't delete {copy} on {name}: {e:#}"),
+                    }
+                });
+            }
+        }
+        sleep(Duration::from_millis(builds::EVERY_MS)).await;
     }
 }
 
@@ -3173,7 +4035,8 @@ async fn watch_builds(d: D) {
             let mut st = d.lock();
             let State { procs, slots, leases, .. } = &mut *st;
             let (mut total, mut trees) = (Usage::default(), HashMap::new());
-            for p in procs.iter_mut() {
+            // Not a remote process's mirror: its usage is the remote's, copied, and no load here.
+            for p in procs.iter_mut().filter(|p| p.remote.is_none()) {
                 p.usage = p.pid.map(|pid| {
                     let tree = builds::tree(&rows, pid);
                     let u = builds::usage(&rows, &tree);
@@ -3395,6 +4258,7 @@ async fn serve(dir: PathBuf, sock: PathBuf, _lock: File) -> Result<()> {
     }
     tokio::spawn(watch_herdr(d.clone()));
     tokio::spawn(expire_leases(d.clone()));
+    tokio::spawn(watch_remote(d.clone()));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
@@ -3408,6 +4272,7 @@ async fn serve(dir: PathBuf, sock: PathBuf, _lock: File) -> Result<()> {
     drop(listener);
     d.lock().stopping = true;
     stop_where(&d, |_| true).await;
+    end_forward();
     drain_retirements(&d).await;
     Ok(())
 }
@@ -3428,7 +4293,7 @@ mod tests {
 
     #[test]
     fn only_becomes_the_runners_own_selection() {
-        let target = |ecosystem: &str, kind: &str| Target { name: "t".into(), ecosystem: ecosystem.into(), dir: "/w".into(), kind: kind.into(), package: None, needs_port: false, port: None, target_dir: None };
+        let target = |ecosystem: &str, kind: &str| Target { name: "t".into(), ecosystem: ecosystem.into(), dir: "/w".into(), kind: kind.into(), package: None, needs_port: false, port: None, target_dir: None, offload: None };
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let map = |t: &Target, only: &[&str], args: &[&str]| only_args(eco::get(&t.ecosystem), t, &s(only), s(args));
         let xcode = target("xcode", "test");
@@ -3450,7 +4315,7 @@ mod tests {
         let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: Leases::default(), stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0, wake: Default::default() });
         let mut log = LogFile::open(&logs.join("stopped.log")).unwrap();
         log.append(&Record { ts: 0, source: Source::Stdout, level: Level::Info, line: "test tests::a ... ok".into() });
-        let t = Target { name: "cargo test".into(), ecosystem: "cargo".into(), dir: "/w".into(), kind: "test".into(), package: None, needs_port: false, port: None, target_dir: None };
+        let t = Target { name: "cargo test".into(), ecosystem: "cargo".into(), dir: "/w".into(), kind: "test".into(), package: None, needs_port: false, port: None, target_dir: None, offload: None };
         save_results(&d, "stopped", eco::get("cargo"), t, HashMap::new(), logs.join("stopped.log"), true).await;
         let saved: Value = serde_json::from_slice(&std::fs::read(logs.join("stopped.tests.json")).unwrap()).unwrap();
         assert_eq!(saved["only"], true);
@@ -3578,7 +4443,7 @@ mod tests {
         // Stopped: the process is gone by the time its problems would be saved.
         let logs = scratch();
         let d: D = Arc::new(Daemon { st: Mutex::new(state(Leases::default())), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0, wake: Default::default() });
-        let t = Target { name: "app".into(), ecosystem: "xcode".into(), dir: root.clone(), kind: "app".into(), package: None, needs_port: false, port: None, target_dir: None };
+        let t = Target { name: "app".into(), ecosystem: "xcode".into(), dir: root.clone(), kind: "app".into(), package: None, needs_port: false, port: None, target_dir: None, offload: None };
         save_problems(&d, "gone", &t, true).await;
         assert!(!logs.join("gone.problems.json").exists());
     }
@@ -3937,6 +4802,7 @@ mod tests {
             needs_port: false,
             port: None,
             target_dir: None,
+            offload: None,
         };
         let (repo, _) = stored(&path, &t);
         store(&path, &repo, &t.name, Some(json!({"device": "d", "runtime": "r", "head": true}))).unwrap();
@@ -4086,7 +4952,7 @@ mod tests {
 
     #[test]
     fn a_destination_is_for_commands_one_at_a_time() {
-        let t = |ecosystem: &str, kind: &str| Target { name: "t".into(), ecosystem: ecosystem.into(), dir: "/w".into(), kind: kind.into(), package: None, needs_port: false, port: None, target_dir: None };
+        let t = |ecosystem: &str, kind: &str| Target { name: "t".into(), ecosystem: ecosystem.into(), dir: "/w".into(), kind: kind.into(), package: None, needs_port: false, port: None, target_dir: None, offload: None };
         let code = |t: &Target, p: Value| check_dest(t, &p).err().map(|e| e.downcast_ref::<Coded>().unwrap().0.clone());
         assert_eq!(code(&t("cargo", "test"), json!({"simulator": true})), Some("bad_request".into()));
         assert_eq!(code(&t("task", "exec"), json!({"simulator": true, "physical": "Test iPhone"})), Some("bad_request".into()));
@@ -4297,6 +5163,7 @@ mod tests {
             needs_port: false,
             port: None,
             target_dir: None,
+            offload: None,
         };
         Proc {
             id: id.into(),
@@ -4324,7 +5191,10 @@ mod tests {
             problems: None,
             usage: None,
             awaits_slot: false,
+            remote: None,
             timed_out: false,
+            forward: None,
+            slotted: false,
             t,
         }
     }
@@ -4337,7 +5207,7 @@ mod tests {
             "toy"
         }
         fn detect(&self, dir: &Path) -> Result<Vec<Target>> {
-            Ok(vec![Target { name: "suite".into(), ecosystem: "toy".into(), dir: dir.into(), kind: "test".into(), package: None, needs_port: false, port: None, target_dir: None }])
+            Ok(vec![Target { name: "suite".into(), ecosystem: "toy".into(), dir: dir.into(), kind: "test".into(), package: None, needs_port: false, port: None, target_dir: None, offload: None }])
         }
         fn needs(&self, _: &Target) -> Vec<Resource> {
             vec![]
@@ -4464,5 +5334,259 @@ mod tests {
         assert_eq!(code(ToyPlatform.physical_devices().unwrap_err()), "bad_request");
         assert_eq!(code(ToyPlatform.find_physical(&[], "x", false).unwrap_err()), "bad_request");
         assert!(!ToyPlatform.slim_persists("Toy 1"));
+    }
+
+    fn target(kind: &str, name: &str, ecosystem: &str) -> Target {
+        Target { name: name.into(), ecosystem: ecosystem.into(), dir: "/w".into(), kind: kind.into(), package: None, needs_port: false, port: None, target_dir: None, offload: None }
+    }
+
+    #[test]
+    fn which_runs_may_go_to_the_remote() {
+        let with = |mut t: Target, offload: Option<bool>| {
+            t.offload = offload;
+            t
+        };
+        let named = |n: &str| json!({"name": n});
+        let physical = json!({"physical": "UDID", "head": false});
+        let server = Target { needs_port: true, ..target("test", "test", "node") };
+        let table: Vec<(Target, Value, Value, bool, &str)> = vec![
+            (target("test", "cargo test", "cargo"), json!({}), Value::Null, true, "a test target"),
+            (target("build", "Core", "xcode"), json!({}), Value::Null, true, "a framework's build"),
+            (with(target("test", "cargo test", "cargo"), Some(false)), json!({}), Value::Null, false, "offload = false"),
+            (target("test", "cargo test", "cargo"), json!({"offload": "never"}), Value::Null, false, "--local"),
+            (target("exec", "test-x", "task"), named("test-x"), Value::Null, true, "a named exec's test action"),
+            (target("exec", "lint", "task"), named("lint"), Value::Null, true, "lint"),
+            (target("exec", "typecheck-web", "task"), named("typecheck-web"), Value::Null, true, "typecheck-…"),
+            (target("exec", "testing", "task"), named("testing"), Value::Null, false, "a word that merely starts with test"),
+            (target("exec", "build", "task"), named("build"), Value::Null, false, "a build exec: its output is wanted here"),
+            (target("exec", "cargo test", "task"), json!({}), Value::Null, false, "the default name is no action"),
+            (target("exec", "cargo test", "task"), json!({"offload": "always"}), Value::Null, true, "--remote, whatever the name"),
+            (target("exec", "test-x", "task"), json!({"name": "test-x", "simulator": true}), Value::Null, false, "--sim"),
+            (target("exec", "test-x", "task"), json!({"name": "test-x", "physical": "iPhone", "offload": "always"}), Value::Null, false, "--physical, even with --remote"),
+            (target("task", "lint", "task"), json!({}), Value::Null, true, "a task's lint action"),
+            (target("task", "deploy", "task"), json!({}), Value::Null, false, "a task without one"),
+            (with(target("task", "deploy", "task"), Some(true)), json!({}), Value::Null, true, "a task with offload = true"),
+            (target("app", "MyApp", "xcode"), json!({"offload": "always"}), Value::Null, false, "an app, even with --remote"),
+            (target("script", "lint", "node"), json!({}), Value::Null, false, "an npm script that isn't a test"),
+            (server, json!({}), Value::Null, false, "anything with a port"),
+            (target("test", "ListTests", "xcode"), json!({}), physical.clone(), false, "a stored physical device"),
+            (target("test", "ListTests", "xcode"), json!({"runtime": "26.5"}), physical, true, "a run that picks a simulator over it"),
+        ];
+        for (t, p, choice, want, why) in table {
+            assert_eq!(offloadable(&t, &p, &choice), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn paths_map_both_ways_at_component_boundaries() {
+        let paths: std::collections::BTreeMap<String, String> = [("/Users/jan/work", "/Users/jan/mirror"), ("/Users/jan/work/deep/", "/Volumes/x")].into_iter().map(|(a, b)| (a.into(), b.into())).collect();
+        let there = |s: &str| map_paths(s, &paths, false);
+        assert_eq!(there(r#"{"cwd":"/Users/jan/work/p","args":["/Users/jan/work"]}"#), r#"{"cwd":"/Users/jan/mirror/p","args":["/Users/jan/mirror"]}"#);
+        assert_eq!(there("src/a.rs at /Users/jan/work/p/a.rs:3:1"), "src/a.rs at /Users/jan/mirror/p/a.rs:3:1");
+        assert_eq!(there("/Users/jan/work/deep/f"), "/Volumes/x/f", "the longest prefix wins");
+        for same in ["/Users/jan/workshop", "/Users/jan/work.bak", "/x/Users/jan/work/p", "~/work"] {
+            assert_eq!(there(same), same, "not a whole component");
+        }
+        assert_eq!(there("→ /Users/jan/work/ü"), "→ /Users/jan/mirror/ü");
+        let here = |s: &str| map_paths(s, &paths, true);
+        assert_eq!(here("error: /Users/jan/mirror/p/a.rs:1"), "error: /Users/jan/work/p/a.rs:1");
+        assert_eq!(here("/Volumes/x/f"), "/Users/jan/work/deep/f");
+        assert_eq!(here("/Users/jan/mirrors/p"), "/Users/jan/mirrors/p");
+    }
+
+    #[test]
+    fn the_forwarded_env_drops_what_describes_this_machine() {
+        let env: HashMap<String, String> = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/Users/jan"),
+            ("SSH_AUTH_SOCK", "/tmp/s"),
+            ("HERDR_PANE_ID", "w1:p1"),
+            ("__CF_USER_TEXT_ENCODING", "0x1F5"),
+            ("XPC_FLAGS", "0x0"),
+            ("COLLIE_STATE_DIR", "/s"),
+            ("DEVELOPER_DIR", "/Applications/Xcode.app"),
+            ("CARGO_HOME", "/Users/jan/.cargo"),
+            ("LIST", "/opt/x:/Users/jan/.local"),
+            ("SRC", "/Users/jan/work/p"),
+            ("RUST_LOG", "debug"),
+            ("OTHER", "/opt/y"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        let kept = forward_env(&env, Path::new("/Users/jan"), &["/Users/jan/work"]);
+        let mut keys: Vec<&str> = kept.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["OTHER", "RUST_LOG", "SRC"], "under the home dir only inside a mapped prefix");
+    }
+
+    #[test]
+    fn a_forwarded_request_is_held_by_holder_at_this_host_and_carries_the_simulator_choice() {
+        let p = json!({"name": "test-x", "args": ["pwd"], "env": {"PATH": "/usr/bin", "K": "v"}, "holder": "t:p1", "cwd": "/w", "offload": null});
+        let req = forward_request(&target("exec", "test-x", "task"), &p, "t:p1", &Value::Null, Path::new("/Users/jan"), &[]);
+        let q = &req["params"];
+        assert_eq!(req["method"], "exec");
+        assert_eq!((&q["holder"], &q["offload"], &q["env"]), (&json!(format!("t:p1@{}", hostname())), &json!("never"), &json!({"K": "v"})), "{req}");
+        assert_eq!((&q["device"], &q["runtime"]), (&Value::Null, &Value::Null), "no simulator for an exec");
+        let choice = json!({"device": "com.apple.D", "runtime": "com.apple.R", "slim": ["icloud"], "head": true});
+        let req = forward_request(&target("test", "ListTests", "xcode"), &json!({"target": "x", "runtime": "26.5"}), "t:p1", &choice, Path::new("/Users/jan"), &[]);
+        let q = &req["params"];
+        assert_eq!((&req["method"], &q["target"]), (&json!("run"), &json!("ListTests")));
+        assert_eq!((&q["device"], &q["runtime"], &q["slim"]), (&json!("com.apple.D"), &json!("26.5"), &json!(["icloud"])), "the run's own runtime over the stored one");
+        assert!(q["head"].is_null() && q["template"].is_null(), "headless, from an empty simulator: {req}");
+    }
+
+    #[test]
+    fn a_remote_exit_becomes_an_exit_status() {
+        let s = exit_status(Some(3), None).unwrap();
+        assert_eq!((s.code(), s.success()), (Some(3), false));
+        assert!(exit_status(Some(0), None).unwrap().success());
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_status(None, Some(9)).unwrap().signal(), Some(9));
+        assert!(exit_status(None, None).is_none(), "it never ran");
+    }
+
+    #[test]
+    fn the_first_eligible_queued_process_moves() {
+        let mk = |id: &str, fwd: bool, leases: Vec<u64>, slotted: bool| {
+            let mut p = my_app(id, leases, &Lease::default(), false);
+            (p.forward, p.slotted) = (fwd.then(|| json!({})), slotted);
+            p
+        };
+        let mut procs = vec![mk("local", false, vec![], false), mk("leased", true, vec![7], false), mk("started", true, vec![], true), mk("d", true, vec![], false), mk("e", true, vec![], false)];
+        let queued: Vec<String> = ["dibs:1", "local", "leased", "started", "d", "e"].map(String::from).to_vec();
+        assert_eq!(pick_move(&queued, &procs).as_deref(), Some("d"), "past a CI dib, a --local, a leased and a started one");
+        procs[3].remote = Some(json!({"name": "mini", "id": null}));
+        assert_eq!(pick_move(&queued, &procs).as_deref(), Some("e"), "not one already moving");
+        assert_eq!(pick_move(&queued[..4], &procs), None);
+    }
+
+    #[tokio::test]
+    async fn a_moving_process_waits_then_moves_or_goes_back_in_the_queue() {
+        let d: D = Arc::new(Daemon { st: Mutex::new(state(Leases::default())), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
+        d.lock().slots.running = vec!["busy".into()];
+        let queue = |id: &'static str| {
+            d.lock().procs.push(my_app(id, vec![], &Lease::default(), false));
+            let dd = d.clone();
+            tokio::spawn(async move { Slot::take(&dd, id).await.map(|s| s.1.clone()) })
+        };
+        let settle = || async {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let moving = |id: &str| {
+            let mut st = d.lock();
+            st.slots.queued.retain(|q| q != id);
+            st.procs.iter_mut().find(|p| p.id == id).unwrap().remote = Some(json!({"name": "mini", "id": null}));
+        };
+        // Moving, then back: it waits while moving (a free slot or not), then takes the slot here.
+        let a = queue("a");
+        settle().await;
+        assert_eq!(d.lock().slots.queued, ["a"]);
+        moving("a");
+        d.lock().slots.running.clear();
+        d.changed();
+        settle().await;
+        assert!(!a.is_finished(), "a moving process never also starts here");
+        {
+            let mut st = d.lock();
+            st.procs[0].remote = None;
+            st.slots.put_back("a".into());
+        }
+        d.changed();
+        assert_eq!(a.await.unwrap().as_deref(), Some("a"));
+        assert!(d.lock().procs[0].slotted, "and can no longer move");
+        // Moving, then moved: it gives up its wait and `lifecycle` leaves it to the mirror.
+        d.lock().slots.running = vec!["busy".into()];
+        let b = queue("b");
+        settle().await;
+        moving("b");
+        d.changed();
+        settle().await;
+        assert!(!b.is_finished());
+        d.lock().procs.iter_mut().find(|p| p.id == "b").unwrap().remote = Some(json!({"name": "mini", "id": "b-9"}));
+        d.changed();
+        assert_eq!(b.await.unwrap(), None);
+        assert!(moved(&d, "b") && d.lock().slots.queued.is_empty());
+    }
+
+    #[test]
+    fn what_git_ignores_is_protected_in_the_copy() {
+        let root = scratch();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&root).env("GIT_CONFIG_GLOBAL", "/dev/null").status().unwrap().success());
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join(".gitignore"), "# build\ntarget/\n*.log\n!keep.log\n\n").unwrap();
+        std::fs::write(root.join("app/.gitignore"), "/Generated/\n*.xcodeproj\n").unwrap();
+        assert_eq!(protect_rules(&root), ["*.log", "*.xcodeproj", "/app/Generated/", "target/"], "anchored ones under their dir; no comments or negations");
+    }
+
+    #[test]
+    fn only_copies_of_worktrees_gone_here_are_cleaned_up() {
+        let ledger = json!({
+            "/l/gone": {"path": "/m/a/gone", "synced_at": 1},
+            "/l/here": {"path": "/m/a/here", "synced_at": 1},
+            "/l/remapped": {"path": "/old/x/remapped", "synced_at": 1},
+            "/l/top": {"path": "/m/a", "synced_at": 1},
+        });
+        let stale = stale_copies(&ledger, &[PathBuf::from("/m/a")], |root| root != Path::new("/l/here"));
+        assert_eq!(stale, [("/l/gone".to_string(), "/m/a/gone".to_string())], "not one still here, outside today's prefixes, or a prefix itself");
+    }
+
+    #[tokio::test]
+    async fn prune_dir_deletes_a_safe_copy_unless_something_runs_there() {
+        let prefixes = [PathBuf::from("/m/a")];
+        assert!(safe_dir(Path::new("/m/a/x"), Some(&prefixes)));
+        for (bad, why) in [("/m/a", "the prefix itself"), ("/m/ab/x", "beside it"), ("/other/x/y", "outside it")] {
+            assert!(!safe_dir(Path::new(bad), Some(&prefixes)), "{why}");
+        }
+        let d: D = Arc::new(Daemon { st: Mutex::new(state(Leases::default())), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
+        let derived = scratch();
+        let refused = async |path: &Path| prune_dir(&d, path, &derived).await.unwrap_err().downcast_ref::<Coded>().unwrap().0.clone();
+        for bad in ["/", "/opt", "/Users/someone", "/home/someone", "relative/x/y", "/a/../b/c"] {
+            assert_eq!(refused(Path::new(bad)).await, "bad_request", "{bad}");
+        }
+        let copy = scratch().join("copy");
+        std::fs::create_dir_all(copy.join("src")).unwrap();
+        assert_eq!(refused(&copy).await, "bad_request", "unmarked: no copy collie made");
+        std::fs::write(copy.join(MARKER), "").unwrap();
+        std::fs::create_dir_all(copy.join(".git")).unwrap();
+        assert_eq!(refused(&copy).await, "bad_request", "a git checkout, marked or not");
+        std::fs::remove_dir_all(copy.join(".git")).unwrap();
+        let built = |name: &str, ws: &Path| {
+            std::fs::create_dir_all(derived.join(name)).unwrap();
+            let plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>WorkspacePath</key><string>{}</string></dict></plist>"#, ws.display());
+            std::fs::write(derived.join(name).join("info.plist"), plist).unwrap();
+        };
+        built("App-of-the-copy", &copy.join("src/App.xcodeproj"));
+        built("App-elsewhere", Path::new("/elsewhere/App.xcodeproj"));
+        let mut p = my_app("live-1", vec![], &Lease::default(), false);
+        p.t.dir = copy.join("src");
+        d.lock().procs.push(p);
+        assert_eq!(refused(&copy).await, "held");
+        assert!(copy.exists());
+        d.lock().procs[0].state = St::Exited;
+        prune_dir(&d, &copy, &derived).await.unwrap();
+        assert!(!copy.exists() && d.lock().procs.is_empty(), "the copy and its ended process go");
+        assert!(!derived.join("App-of-the-copy").exists() && derived.join("App-elsewhere").exists(), "only what was built from the copy");
+    }
+
+    #[tokio::test]
+    async fn a_copy_never_lands_on_a_checkout_or_a_dir_of_someone_elses() {
+        let (state, root) = (scratch(), scratch());
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let r = builds::Remote { host: None, socket: String::new(), paths: Default::default() };
+        let (fresh, checkout, other) = (scratch().join("copy"), scratch(), scratch());
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(other.join("notes.txt"), "mine").unwrap();
+        sync(&state, &r, &root, &fresh).await.unwrap();
+        assert!(fresh.join("a.txt").exists() && fresh.join(MARKER).exists(), "a new copy, marked as collie's");
+        sync(&state, &r, &root, &fresh).await.unwrap();
+        assert!(fresh.join(MARKER).exists(), "the marker survives --delete");
+        for (dest, why) in [(&checkout, "a git checkout"), (&other, "a dir with someone's files")] {
+            let e = sync(&state, &r, &root, dest).await.unwrap_err();
+            assert_eq!(e.downcast_ref::<Coded>().unwrap().0, "sync_failed", "{why}");
+        }
+        assert!(other.join("notes.txt").exists() && !other.join("a.txt").exists());
     }
 }

@@ -18,6 +18,10 @@ pub struct Target {
     pub port: Option<u16>,
     /// Cargo's `target_directory`; None for other ecosystems.
     pub target_dir: Option<PathBuf>,
+    /// `collie.toml`'s `offload`: false keeps it on this machine, true lets a task run on the `[remote]` whatever its
+    /// name. None: by its kind and name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offload: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -145,6 +149,7 @@ pub fn detect_all(dir: &Path) -> Result<Vec<Target>> {
         if let Some(o) = config(&t.dir)?.targets.get(&t.name) {
             t.port = o.port.or(t.port);
             t.needs_port = o.needs_port.unwrap_or(t.needs_port);
+            t.offload = o.offload.or(t.offload);
         }
     }
     // `run` resolves by name, so a task shadowing a detected target would make it pick one of the two silently.
@@ -209,11 +214,13 @@ pub fn newest_change(root: &Path, watch: &[String]) -> Option<std::time::SystemT
 struct Overrides {
     port: Option<u16>,
     needs_port: Option<bool>,
+    offload: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct TaskDef {
     cmd: String,
+    offload: Option<bool>,
 }
 
 /// `dir`'s `collie.toml`; empty when there is none. Code `bad_config` when it can't be read or parsed.
@@ -503,6 +510,7 @@ impl Ecosystem for Cargo {
                         needs_port: false,
                         port: None,
                         target_dir: target_dir.clone(),
+                        offload: None,
                     });
                 }
             }
@@ -517,6 +525,7 @@ impl Ecosystem for Cargo {
             needs_port: false,
             port: None,
             target_dir,
+            offload: None,
         });
         Ok(targets)
     }
@@ -675,6 +684,7 @@ impl Ecosystem for Node {
                 needs_port: name == "dev" || name == "start",
                 port: None,
                 target_dir: None,
+                offload: None,
             })
             .collect())
     }
@@ -725,8 +735,8 @@ impl Ecosystem for Task {
         let Some(root) = dir.ancestors().find(|d| d.join("collie.toml").is_file()) else { return Ok(vec![]) };
         Ok(config(root)?
             .tasks
-            .into_keys()
-            .map(|name| Target {
+            .into_iter()
+            .map(|(name, def)| Target {
                 name,
                 ecosystem: self.id().into(),
                 dir: root.into(),
@@ -735,6 +745,7 @@ impl Ecosystem for Task {
                 needs_port: false,
                 port: None,
                 target_dir: None,
+                offload: def.offload,
             })
             .collect())
     }
@@ -1273,6 +1284,7 @@ impl Ecosystem for Xcode {
                     needs_port: false,
                     port: None,
                     target_dir: None,
+                    offload: None,
                 };
                 if app {
                     targets.push(target(name.clone(), "app"));
@@ -2025,6 +2037,10 @@ mod tests {
         std::fs::write(dir.join("collie.toml"), "[targets.dev]\nport = 3000\n").unwrap();
         let dev = detect_all(&dir).unwrap().into_iter().find(|t| t.name == "dev").unwrap();
         assert_eq!(dev.port, Some(3000));
+        std::fs::write(dir.join("collie.toml"), "[targets.dev]\noffload = false\n[tasks.check]\ncmd = \"true\"\noffload = true\n").unwrap();
+        let ts = detect_all(&dir).unwrap();
+        let by = |n: &str| ts.iter().find(|t| t.name == n).unwrap().offload;
+        assert_eq!((by("dev"), by("check")), (Some(false), Some(true)), "offload from [targets.*] and [tasks.*]");
         let (code, msg) = err("[tasks.dev]\ncmd = \"true\"\n");
         assert_eq!(code, "bad_config");
         assert!(msg.ends_with("collie.toml: task \"dev\" clashes with node target \"dev\""), "{msg}");
@@ -2197,7 +2213,7 @@ mod tests {
         assert_eq!(mirrored(nslog).map(|at| &nslog[at..]), Some("[authentication] x"));
         assert_eq!(mirrored("2026-10-30 12:57:21 xctest[44560:63578734] x"), None);
         // A device launch asks for debug-level mirroring, over the caller's env.
-        let t = Target { name: "A".into(), ecosystem: "xcode".into(), dir: "/w".into(), kind: "app".into(), package: None, needs_port: false, port: None, target_dir: None };
+        let t = Target { name: "A".into(), ecosystem: "xcode".into(), dir: "/w".into(), kind: "app".into(), package: None, needs_port: false, port: None, target_dir: None, offload: None };
         let settings = json!({"TARGET_BUILD_DIR": "/b", "WRAPPER_NAME": "A.app", "PRODUCT_BUNDLE_IDENTIFIER": "a.b"});
         let mut xb = Command::new("xcodebuild");
         xb.env("DEVICECTL_CHILD_OS_ACTIVITY_MODE", "info");
@@ -2313,7 +2329,7 @@ mod tests {
         for no in ["xcrun simctl list", "cargo test", "sh -c 'xcodebuild'", ""] {
             assert!(!runs_xcode(&argv(no)), "{no}");
         }
-        let exec = Target { name: "b".into(), ecosystem: "task".into(), dir: "/w".into(), kind: "exec".into(), package: None, needs_port: false, port: None, target_dir: None };
+        let exec = Target { name: "b".into(), ecosystem: "task".into(), dir: "/w".into(), kind: "exec".into(), package: None, needs_port: false, port: None, target_dir: None, offload: None };
         assert_eq!(command_of(&exec, &argv("tuist test")), argv("tuist test"));
     }
 

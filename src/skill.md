@@ -133,6 +133,21 @@ build slot, an app's or server's run phase doesn't. With every slot taken, a pro
   `usage` (`cpu` in percent of one core, summed over its process tree; `mem` in bytes).
 - The limits are the user's, in `~/.config/collie/config.toml`; never edit it unless asked.
 
+### On another Mac
+
+The user may have a second Mac collie hands slot work to when no slot here is free: test targets, Xcode framework
+builds, and tasks or `exec --name` commands named `test`, `lint`, `typecheck` (or `test-…`, `lint-…`, `typecheck-…`).
+Such a process shows `"remote": {"name": "<host>", "id": "<its id there>"}` (`id` null while a queued one moves
+there); nothing else changes: `wait`, `logs` (paths are this machine's), `tests`, `problems`, `stop` and `history` work
+as for any process. `status --json` shows the other Mac's slots as `builds.remote`.
+
+- Pass `--local` to `run`/`exec` when the command needs this machine: build output it will use here, a server on this
+  machine's `localhost`, or git during the build (the other Mac gets the tree without `.git`).
+- Never pass `--remote` unless the user asks for it.
+- A command that writes to the tree (a formatter, `lint --fix`, codegen) must not be named `test`, `lint` or
+  `typecheck`: its writes would land in the other Mac's copy and be lost.
+- "Your next test run reuses the simulator" holds only on one machine: alternating machines means fresh simulators.
+
 ## Sharing with others
 
 - `run` on a target someone else is running fails with code `held` and names the holder.

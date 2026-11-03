@@ -70,6 +70,12 @@ enum Cmd {
         /// This run on a stock simulator, over the target's stored setting
         #[arg(long)]
         stock: bool,
+        /// Run here even when the build slots are full and the `[remote]` Mac is free
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
+        /// Run on the `[remote]` Mac even when a slot here is free; fails when it can't
+        #[arg(long)]
+        remote: bool,
         /// Appended to the run phase's command (not the build's); refused for iOS apps
         #[arg(last = true)]
         args: Vec<String>,
@@ -109,6 +115,12 @@ enum Cmd {
         /// --sim's simulator stock (the default for exec)
         #[arg(long)]
         stock: bool,
+        /// Run here even when the build slots are full and the `[remote]` Mac is free
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
+        /// Run on the `[remote]` Mac even when a slot here is free, whatever the name; fails when it can't
+        #[arg(long)]
+        remote: bool,
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
     },
@@ -325,16 +337,17 @@ fn run(cli: &Cli) -> Result<()> {
             }
         }
         Cmd::Targets => out(request("targets", json!({}))?),
-        Cmd::Run { target, take, device, runtime, timeout, only, sim, physical, no_queue, slim, stock, args } => {
+        Cmd::Run { target, take, device, runtime, timeout, only, sim, physical, no_queue, slim, stock, local, remote, args } => {
             let env: HashMap<_, _> = std::env::vars().collect();
             let p = json!({"target": target, "take": take, "env": env, "device": device, "runtime": runtime, "args": args, "timeout_ms": timeout, "only": only,
-                "simulator": sim, "physical": physical, "queue": !no_queue, "slim": slim_param(slim, *stock)});
+                "simulator": sim, "physical": physical, "queue": !no_queue, "slim": slim_param(slim, *stock), "offload": offload_param(*local, *remote)});
             out(request("run", p)?)
         }
-        Cmd::Exec { name, take, timeout, sim, device, runtime, physical, no_queue, slim, stock, cmd } => {
+        Cmd::Exec { name, take, timeout, sim, device, runtime, physical, no_queue, slim, stock, local, remote, cmd } => {
             let env: HashMap<_, _> = std::env::vars().collect();
             let p = json!({"name": name, "take": take, "env": env, "args": cmd, "timeout_ms": timeout,
-                "simulator": sim, "device": device, "runtime": runtime, "physical": physical, "queue": !no_queue, "slim": slim_param(slim, *stock)});
+                "simulator": sim, "device": device, "runtime": runtime, "physical": physical, "queue": !no_queue, "slim": slim_param(slim, *stock),
+                "offload": offload_param(*local, *remote)});
             out(request("exec", p)?)
         }
         Cmd::Sims { cmd: Some(SimsCmd::Set { target, device, runtime, reset, head, physical, slim }) } => {
@@ -491,6 +504,15 @@ fn slim_param(slim: &Option<String>, stock: bool) -> Value {
         Some(keep) if keep.trim() == "off" => false.into(),
         Some(keep) => keep.split(',').map(str::trim).filter(|c| !c.is_empty() && *c != "on").collect::<Vec<_>>().into(),
         None => Value::Null,
+    }
+}
+
+/// `run`'s `offload` from `--local` and `--remote`: null for neither (the daemon decides).
+fn offload_param(local: bool, remote: bool) -> Value {
+    match (local, remote) {
+        (true, _) => "never".into(),
+        (_, true) => "always".into(),
+        _ => Value::Null,
     }
 }
 

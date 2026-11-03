@@ -50,6 +50,8 @@ collie is the shared layer underneath:
 - **Build slots** — only so many builds, `exec` commands and test runs at once; fewer while the slot holders'
   processes use too much CPU or memory, with every build but one slowed to background priority (never below one).
   CI jobs on the same machine join the queue, ahead of agents.
+- **Offloading** — with no slot free, tests, lints and framework builds run on another Mac over SSH (see
+  [Offloading to another Mac](#offloading-to-another-mac)), mirrored locally.
 - **History** — ended runs and their logs, kept 7 days.
 - **A terminal UI** — targets, tests, history, problems and live logs in one pane (`collie tui`), standalone
   or inside herdr.
@@ -278,12 +280,71 @@ actions. The pane is the human's view of what every agent is running.
 - Database dibs survive a daemon restart; processes don't. `collie daemon stop` stops everything it runs, for
   every holder.
 
-## Roadmap
+## Offloading to another Mac
 
-Ideas being explored, not built yet:
+A second Mac running collie (a Mac mini build box, say) can take slot work off a laptop. When the laptop has no free
+build slot and the mini does, collie copies the worktree there with rsync, starts the same run on the mini's daemon
+over an SSH-forwarded socket, and mirrors it locally: state, logs (paths mapped back), test results, problems and the
+exit. You and every agent keep using the one local `collie`; a process that runs there shows
+`"remote": {"name": "macmini", "id": "<its id there>"}` in `status`. Processes already queued on the laptop move to the
+mini as soon as it frees up (`id` is null while one moves).
 
-- **Remote execution** — run the daemon on another Mac (a Mac mini build box) and drive it from a laptop over SSH,
-  with logs and status streaming back.
+On the laptop, in `~/.config/collie/config.toml`:
+
+```toml
+[remote]
+host = "macmini"                                   # ssh destination
+socket = "/Users/you/.local/state/collie/collie.sock"  # the mini daemon's socket, on the mini
+[remote.paths]
+"/Users/you/Projects" = "/Users/you/collie-mirror" # where the copies go there; one to one, absolute
+```
+
+The mirror dir on the mini must be collie's alone: never your own checkouts there. collie syncs with `--delete` and
+deletes copies of worktrees you remove, so it marks each copy it makes (`.collie-copy`) and refuses to sync over or
+delete a git checkout or a dir it didn't make.
+
+`collie status` shows the mini's slots as `builds.remote` (`cap`, `running`, `queued`, `version`, and `error` when
+it takes no work: unreachable, or another commit).
+
+**What goes:** test targets (cargo, npm, Xcode test schemes on a simulator), Xcode framework `build` targets (their
+build output stays on the mini), and tasks and `exec --name` commands named `test`, `lint` or `typecheck` (or
+`test-…`, `lint-…`, `typecheck-…`). **What never goes:** apps and servers, physical devices, `exec --sim/--physical`,
+anything else. Per run, `--local` keeps it here and `--remote` sends it there even with a free slot here (and fails if
+it can't). Per target, in `collie.toml`:
+
+```toml
+[targets."cargo test"]
+offload = false     # e.g. tests that hit a server on the laptop's localhost, or read the build's output here
+
+[tasks.check]
+cmd = "make check"
+offload = true      # a task that may go whatever its name
+```
+
+**Setting up the mini:**
+
+- The same collie, built from the **same commit** as the laptop's: every reply carries the daemon's commit, and a
+  mismatch (or `unknown`, a build outside git) stops offloading with a warning in `builds.remote.error`.
+- Its daemon as a LaunchAgent (see "CI on the same machine"), started through a login shell so the runs get your
+  `PATH` and toolchain: `<array><string>/bin/zsh</string><string>-lc</string><string>exec ~/.local/bin/collie daemon
+  --foreground</string></array>`. The laptop sends only the env that isn't machine-specific.
+- The laptop's daemon runs `ssh` itself, often without an ssh agent (a LaunchAgent has no `SSH_AUTH_SOCK`): the key
+  must load from `~/.ssh/config` (`IdentityFile`, `UseKeychain yes`), since it runs with `BatchMode`. Tailscale SSH may
+  not forward Unix sockets; plain sshd over Tailscale does. Keep the socket paths under 104 bytes.
+- rsync: macOS's own (openrsync) does. The copy gets what git tracks and what it doesn't ignore, never `.git`; what
+  the tree ignores stays untouched on the mini (its `target/`, generated projects), so its builds stay incremental.
+- For Xcode tests: the Xcode a project's `.xcode-version` names, and the simulator runtimes and device types its
+  tests pin (snapshot suites). A run the mini can't do (a missing runtime) falls back to the laptop.
+- Files git ignores but the build needs (`.env`, `Secrets.xcconfig`) aren't synced: put them on the mini once.
+
+Not synced either: `.git`. Builds that read git themselves (a Cargo `build.rs` calling `git`, an Xcode run script
+running `git describe`) see no repo on the mini: give them `offload = false`. Simulators on the mini start empty
+(laptop templates don't carry over), and a test run reuses the simulator of the last one only on the same machine.
+
+**Cleanup is automatic.** collie records each copy (`remote.json` in the state dir); within about 5 s of a worktree
+disappearing on the laptop (`wt remove`, `git worktree remove`), the mini deletes its copy, its ended processes there
+(and the simulators they kept) and the Xcode DerivedData built from it, unless something still runs there. It never
+deletes a mapped prefix itself, `/`, a home dir, a git checkout or a dir without its `.collie-copy` marker.
 
 ## Development
 
