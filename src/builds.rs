@@ -36,6 +36,33 @@ impl Knobs {
 #[derive(Deserialize, Default)]
 struct File {
     builds: Option<Partial>,
+    remote: Option<Remote>,
+}
+
+/// The `[remote]` table: another Mac's daemon that takes slot work when this one has no free slot.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Remote {
+    /// The ssh destination its socket is forwarded from; without one, `socket` is a path on this machine (tests).
+    pub host: Option<String>,
+    /// Its daemon's socket, on its machine.
+    pub socket: String,
+    /// Absolute path prefixes here and where the same trees live there, one to one.
+    #[serde(default)]
+    pub paths: std::collections::BTreeMap<String, String>,
+}
+
+impl Remote {
+    /// How it shows in logs and status: its ssh host, else `remote`.
+    pub fn name(&self) -> &str {
+        self.host.as_deref().unwrap_or("remote")
+    }
+}
+
+/// The `[remote]` table of the config at `path`; None without one, or when the file doesn't parse (`knobs` reports
+/// that as `config_error`).
+pub fn remote(path: &Path) -> Option<Remote> {
+    toml::from_str::<File>(&std::fs::read_to_string(path).ok()?).ok()?.remote
 }
 
 #[derive(Deserialize, Default)]
@@ -101,7 +128,7 @@ pub fn sample() -> Vec<Row> {
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     /// Percent of one core, summed: 250 is two and a half cores.
     pub cpu: f64,
@@ -149,6 +176,10 @@ pub struct Slots {
     pub queued: Vec<String>,
     /// Why the config file was ignored, if it was.
     pub config_error: Option<String>,
+    /// The `[remote]` daemon's slots at its last reading: `{"host", "cap", "running", "queued", "version", "at",
+    /// "error"}`, counts, `at` in Unix ms, `error` null or why it takes no work (unreachable, version mismatch). Null
+    /// without a `[remote]`.
+    pub remote: Option<serde_json::Value>,
     #[serde(skip)]
     prioritised: HashSet<String>,
     #[serde(skip)]
@@ -166,7 +197,33 @@ impl Default for Slots {
 
 impl Slots {
     pub fn new(knobs: Knobs, cores: usize, ram: u64) -> Self {
-        Slots { cap: knobs.max, knobs, cores, ram, usage: Usage::default(), slowed: false, running: vec![], queued: vec![], config_error: None, prioritised: HashSet::new(), over: 0, under: 0 }
+        Slots { cap: knobs.max, knobs, cores, ram, usage: Usage::default(), slowed: false, running: vec![], queued: vec![], config_error: None, remote: None, prioritised: HashSet::new(), over: 0, under: 0 }
+    }
+
+    /// Whether a process starting now would wait for a slot: none is free, or others wait already.
+    pub fn would_queue(&self) -> bool {
+        self.running.len() >= self.cap || !self.queued.is_empty()
+    }
+
+    /// Whether the remote may take work at `now` from a daemon at commit `ours`: read recently, without an error, at
+    /// the same known commit.
+    pub fn remote_usable(&self, now: u64, ours: &str) -> bool {
+        // ponytail: two samples, not one: a reading is up to a sample plus the round trip old just before the next.
+        let fresh = |r: &serde_json::Value| r["at"].as_u64().is_some_and(|at| now.saturating_sub(at) <= 2 * EVERY_MS);
+        self.remote.as_ref().is_some_and(|r| fresh(r) && r["error"].is_null() && ours != "unknown" && r["version"] == ours)
+    }
+
+    /// `remote_usable`, with a slot free there and nothing (a CI job's dib included) waiting for one; `pending`: runs
+    /// on their way there that its reading doesn't count yet.
+    pub fn remote_idle(&self, now: u64, ours: &str, pending: usize) -> bool {
+        let n = |k: &str| self.remote.as_ref().and_then(|r| r[k].as_u64()).unwrap_or_default();
+        self.remote_usable(now, ours) && n("running") + (pending as u64) < n("cap") && n("queued") == 0
+    }
+
+    /// Queues `id` again where it was, at the front, but behind the prioritised entries: a move to the remote failed.
+    pub fn put_back(&mut self, id: String) {
+        let at = self.queued.iter().take_while(|q| self.prioritised.contains(*q)).count();
+        self.queued.insert(at, id);
     }
 
     /// Whether `id`, queued, may take a slot now: one is free and nobody queued before it.
@@ -310,6 +367,68 @@ mod tests {
         s.running.push("ci1".into());
         s.enqueue("ci3".into(), true);
         assert_eq!(s.queued, ["ci2", "ci3", "a", "b"], "one that left is no longer counted among the prioritised");
+    }
+
+    #[test]
+    fn a_process_would_queue_with_every_slot_taken_or_others_waiting() {
+        let mut s = Slots::new(knobs(2), 4, GB);
+        assert!(!s.would_queue());
+        busy(&mut s, 1);
+        assert!(!s.would_queue(), "one of two taken");
+        s.queued = vec!["dibs:1".into()];
+        assert!(s.would_queue(), "a free slot, but a CI dib is about to take it");
+        s.queued.clear();
+        s.cap = 1;
+        assert!(s.would_queue(), "the cap dropped under pressure");
+    }
+
+    #[test]
+    fn the_remote_is_idle_only_when_fresh_free_error_free_and_at_our_commit() {
+        let at = |s: &mut Slots, v: serde_json::Value| s.remote = Some(v);
+        let mut s = Slots::new(knobs(1), 4, GB);
+        let idle = serde_json::json!({"host": "mini", "cap": 2, "running": 1, "queued": 0, "version": "abc", "at": 1000, "error": null});
+        assert!(!s.remote_idle(1000, "abc", 0), "no reading yet");
+        at(&mut s, idle.clone());
+        assert!(s.remote_idle(1000, "abc", 0));
+        assert!(!s.remote_idle(1000, "abc", 1), "its free slot is already spoken for by a run on its way there");
+        assert!(!s.remote_idle(1000 + 2 * EVERY_MS + 1, "abc", 0), "a stale reading");
+        let with = |k: &str, v: serde_json::Value| {
+            let mut r = idle.clone();
+            r[k] = v;
+            r
+        };
+        at(&mut s, with("queued", 1.into()));
+        assert!(!s.remote_idle(1000, "abc", 0) && s.remote_usable(1000, "abc"), "a CI job queued there goes first");
+        at(&mut s, with("cap", 1.into()));
+        assert!(!s.remote_idle(1000, "abc", 0), "its cap dropped to what runs");
+        at(&mut s, with("version", "def".into()));
+        assert!(!s.remote_usable(1000, "abc"), "another commit");
+        at(&mut s, with("version", "unknown".into()));
+        assert!(!s.remote_usable(1000, "unknown"), "unknown on both sides is no match");
+        at(&mut s, with("error", "unreachable".into()));
+        assert!(!s.remote_usable(1000, "abc"));
+    }
+
+    #[test]
+    fn a_put_back_entry_goes_first_but_behind_prioritised_ones() {
+        let mut s = Slots::new(knobs(1), 4, GB);
+        s.enqueue("ci".into(), true);
+        s.enqueue("b".into(), false);
+        s.put_back("a".into());
+        assert_eq!(s.queued, ["ci", "a", "b"]);
+    }
+
+    #[test]
+    fn the_config_reads_a_remote_table() {
+        let dir = std::env::temp_dir().join(format!("collie-remote-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        assert_eq!(remote(&path), None);
+        std::fs::write(&path, "[builds]\nmax = 1\n[remote]\nhost = \"macmini\"\nsocket = \"/s.sock\"\n[remote.paths]\n\"/a\" = \"/b\"\n").unwrap();
+        let r = remote(&path).unwrap();
+        assert_eq!((r.name(), r.socket.as_str(), r.paths.get("/a").map(String::as_str)), ("macmini", "/s.sock", Some("/b")));
+        assert_eq!(super::knobs(&path, 4).1, None, "the builds knobs still read");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

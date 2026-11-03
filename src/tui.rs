@@ -2241,6 +2241,9 @@ impl App {
             let process = w["process"].as_str().map_or(String::new(), |p| format!(" ({p})"));
             rows.push((Line::from(format!("… {}{process} waits for {want}", holder(w))).dim(), None));
         }
+        if let Some(there) = remote_slots(&self.status["builds"]["remote"]) {
+            rows.push((Line::from(format!("⇄ {there}")).dim(), None));
+        }
         if rows.is_empty() {
             f.render_widget(Line::from(" no dibs").dim(), Rect { height: 1.min(inner.height), ..inner });
             return;
@@ -2285,10 +2288,15 @@ impl App {
                     Some(end) => format!("  took {}", ago(end.saturating_sub(since))).dim(),
                     None => format!("  up {}", ago(now_ms().saturating_sub(since))).dim(),
                 });
-                if p["awaits_slot"] == true {
+                // A run sent there as it starts doesn't await a slot here, but is moving while its copy syncs.
+                if let (Some(h), true) = (p["remote"]["name"].as_str(), p["awaits_slot"] == true || p["remote"]["id"].is_null()) {
+                    let doing = if p["remote"]["id"].is_null() { "moving to" } else { "queued for a build slot on" };
+                    info.push(format!("  {doing} {h}").yellow());
+                } else if p["awaits_slot"] == true {
                     let b = &self.status["builds"];
                     let busy = b["running"].as_array().map_or(0, Vec::len);
-                    info.push(format!("  queued for a build slot ({busy} of {} busy)", b["cap"]).yellow());
+                    let there = remote_slots(&b["remote"]).map_or(String::new(), |r| format!("; {r}"));
+                    info.push(format!("  queued for a build slot ({busy} of {} busy{there})", b["cap"]).yellow());
                 } else if p["state"] == "queued" {
                     let udid = &p["device"]["udid"];
                     let lease = self.status["leases"].as_array().into_iter().flatten().find(|l| &l["device"]["udid"] == udid);
@@ -2770,6 +2778,18 @@ fn run_badge(r: &Value, now: u64) -> [Span<'static>; 2] {
     [outcome, format!(" · {}", ago(end.saturating_sub(r["since"].as_u64().unwrap_or(end)))).dim()]
 }
 
+/// The `[remote]`'s slots from `builds.remote`, e.g. `macmini: 1 of 2 slots free`, or why it takes no work; None
+/// without a `[remote]`.
+fn remote_slots(r: &Value) -> Option<String> {
+    let host = r["host"].as_str()?;
+    if let Some(e) = r["error"].as_str() {
+        return Some(format!("{host}: {e}"));
+    }
+    let n = |k: &str| r[k].as_u64().unwrap_or_default();
+    let queued = if n("queued") > 0 { format!(", {} queued", n("queued")) } else { String::new() };
+    Some(format!("{host}: {} of {} slots free{queued}", n("cap").saturating_sub(n("running")), n("cap")))
+}
+
 fn badge(p: &Value) -> Span<'static> {
     let state = text(&p["state"]);
     let code = match (p["code"].as_i64(), p["signal"].as_i64()) {
@@ -2780,7 +2800,12 @@ fn badge(p: &Value) -> Span<'static> {
     let port = p["port"].as_u64().map_or(String::new(), |n| format!(" :{n}"));
     let sim = p["simulator"]["name"].as_str().or(p["device"]["name"].as_str()).map_or(String::new(), |n| format!(" {n}"));
     let lock = if p["blocked"] == true { " · waiting for a lock" } else { "" };
-    let s = format!("[{state}{code}{port}{sim}{lock}]");
+    let on = match (p["remote"]["name"].as_str(), p["remote"]["id"].is_null()) {
+        (Some(h), true) => format!(" → {h}"),
+        (Some(h), false) => format!(" @{h}"),
+        (None, _) => String::new(),
+    };
+    let s = format!("[{state}{code}{port}{sim}{on}{lock}]");
     match state {
         "running" => s.green(),
         "building" | "queued" => s.yellow(),

@@ -9,15 +9,22 @@ use std::time::Duration;
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// A daemon with its own state dir and no herdr; stopped on drop.
-struct Daemon(PathBuf, #[allow(dead_code)] MutexGuard<'static, ()>);
+struct Daemon(PathBuf, #[allow(dead_code)] Option<MutexGuard<'static, ()>>);
 
 impl Daemon {
     fn new(name: &str) -> Self {
         let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = Daemon::beside(name);
+        d.1 = Some(turn);
+        d
+    }
+
+    /// A second daemon within a test that holds `ONE_AT_A_TIME` already (its first one's).
+    fn beside(name: &str) -> Self {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Daemon(dir, turn)
+        Daemon(dir, None)
     }
 
     /// `collie --json <args>` in the node fixture as herdr pane `holder`.
@@ -528,4 +535,214 @@ fn follow_moves_on_to_the_restarted_process() {
     assert!(seen("listening on"), "follow streams the restarted process");
     let _ = follow.kill();
     let _ = follow.wait();
+}
+
+fn status(d: &Daemon) -> Value {
+    d.collie("t:p0", &["status"]).1
+}
+
+/// `target`'s newest process in a `status`, or null.
+fn proc_of(status: &Value, target: &str) -> Value {
+    status["processes"].as_array().and_then(|ps| ps.iter().rfind(|p| p["target"] == target)).cloned().unwrap_or_default()
+}
+
+/// Polls `f` for up to 20 s: the remote is read every 5 s.
+fn until(what: &str, f: impl Fn() -> bool) {
+    let t0 = std::time::Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(20), "timed out waiting until {what}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A "laptop" daemon A and a "mini" daemon B on this machine, one build slot each; A's `[remote]` is B, with
+/// `<A>/work` here being `<B>/mirror` there. Returns once A has read B's slots.
+fn pair(name: &str) -> (Daemon, Daemon) {
+    let a = Daemon::new(&format!("{name}-a"));
+    let b = Daemon::beside(&format!("{name}-b"));
+    std::fs::write(b.0.join("config.toml"), "[builds]\nmax = 1\n").unwrap();
+    let (sock, work, mirror) = (b.0.join("collie.sock"), a.0.join("work"), b.0.join("mirror"));
+    let cfg = format!("[builds]\nmax = 1\n\n[remote]\nsocket = {sock:?}\n\n[remote.paths]\n{work:?} = {mirror:?}\n");
+    std::fs::write(a.0.join("config.toml"), cfg).unwrap();
+    let (ok, v) = b.collie("t:b", &["status"]);
+    assert!(ok, "B starts: {v}");
+    until("A reads B's slots", || {
+        let r = &status(&a)["builds"]["remote"];
+        r["error"].is_null() && r["cap"] == 1
+    });
+    (a, b)
+}
+
+/// `<A>/work/<name>`, a git repo of its own (a worktree is synced from its git root), with `fixture`'s files.
+fn work_repo(a: &Daemon, name: &str, fixture: Option<&str>) -> PathBuf {
+    let dir = a.0.join("work").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    if let Some(f) = fixture {
+        let src = format!("{}/tests/fixtures/{f}/.", env!("CARGO_MANIFEST_DIR"));
+        assert!(Command::new("cp").args(["-R", &src]).arg(&dir).status().unwrap().success());
+    }
+    let git = Command::new("git").args(["init", "-q"]).current_dir(&dir).env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1").status();
+    assert!(git.unwrap().success());
+    dir
+}
+
+#[test]
+fn a_run_without_a_slot_here_runs_on_the_remote_and_reports_back() {
+    let (a, b) = pair("offload");
+    let repo = work_repo(&a, "proj", None);
+    let run = |args: &[&str]| a.collie_in(&repo, args);
+    let (ok, v) = run(&["exec", "--name", "hold", "--", "sleep", "60"]);
+    assert!(ok, "{v}");
+    // The remote's own state dir: the forwarded env drops this machine's.
+    let (ok, v) = run(&["exec", "--name", "test-x", "--", "sh", "-c", "pwd; echo \"$COLLIE_STATE_DIR\""]);
+    assert!(ok, "{v}");
+    assert_eq!(v["remote"]["name"], "remote", "{v}");
+    let rid = v["remote"]["id"].as_str().expect("a remote process id").to_string();
+    let (ok, ended) = run(&["wait", "--until", "exited", "--timeout", "20000", "test-x"]);
+    assert_eq!((ok, &ended["state"], &ended["code"]), (true, &"exited".into(), &0.into()), "{ended}");
+    let there = &b.collie("t:p0", &["history", "--all", "test-x"]).1["runs"][0];
+    assert_eq!((&there["id"], &there["dir"]), (&rid.as_str().into(), &b.0.join("mirror/proj").to_str().unwrap().into()), "{there}");
+    assert!(there["holder"].as_str().unwrap().starts_with("t:p1@"), "held by A's holder at A's host: {there}");
+    let out = lines(&a, "test-x");
+    assert!(out.contains(&repo.display().to_string()), "B's path mapped back to A's: {out:?}");
+    assert!(out.contains(&b.0.display().to_string()), "it ran on B: {out:?}");
+    let (_, history) = run(&["history", "test-x"]);
+    assert_eq!(history["runs"][0]["remote"]["id"], rid.as_str(), "{history}");
+
+    // Live: A shows B's slot taken; a stop here stops it there.
+    let (ok, v) = run(&["exec", "--name", "test-z", "--", "sleep", "60"]);
+    assert!(ok && v["remote"]["id"].is_string(), "{v}");
+    until("B runs test-z", || proc_of(&status(&b), "test-z")["state"] == "running");
+    until("A sees B's slot taken", || status(&a)["builds"]["remote"]["running"] == 1);
+    assert!(run(&["stop", "test-z"]).0);
+    until("B stopped test-z", || proc_of(&status(&b), "test-z").is_null());
+    until("A sees B's slot free", || status(&a)["builds"]["remote"]["running"] == 0);
+
+    // --local waits here although B is free; --remote goes there although a slot here is free.
+    let (ok, v) = run(&["exec", "--local", "--name", "test-l", "--", "true"]);
+    assert!(ok && v["remote"].is_null(), "{v}");
+    until("test-l queues here", || proc_of(&status(&a), "test-l")["awaits_slot"] == true);
+    assert!(run(&["stop", "hold"]).0);
+    let (ok, ended) = run(&["wait", "--until", "exited", "--timeout", "15000", "test-l"]);
+    assert!(ok && ended["remote"].is_null(), "{ended}");
+    let (ok, v) = run(&["exec", "--remote", "--name", "anything", "--", "true"]);
+    assert!(ok && v["remote"]["id"].is_string(), "{v}");
+}
+
+#[test]
+fn an_offloaded_cargo_test_reports_its_tests_here_unless_kept_here() {
+    let (a, _b) = pair("offload-tests");
+    let repo = work_repo(&a, "cargo", Some("cargo-tests"));
+    let run = |args: &[&str]| a.collie_in(&repo, args);
+    assert!(run(&["exec", "--name", "hold", "--", "sleep", "300"]).0);
+    let (ok, v) = run(&["run", "cargo test"]);
+    assert!(ok && v["remote"]["id"].is_string(), "{v}");
+    let (ok, ended) = run(&["wait", "--until", "exited", "--timeout", "180000", "cargo test"]);
+    assert!(ok, "{ended}");
+    let totals = &ended["tests"];
+    assert_eq!((&totals["passed"], &totals["failed"], &totals["skipped"]), (&1.into(), &1.into(), &1.into()), "{ended}");
+    let (ok, tests) = run(&["tests", "cargo test"]);
+    assert!(ok, "{tests}");
+    assert_eq!(tests["tests"].as_array().map(Vec::len), Some(3), "{tests}");
+    std::fs::write(repo.join("collie.toml"), "[targets.\"cargo test\"]\noffload = false\n").unwrap();
+    let (ok, v) = run(&["run", "cargo test"]);
+    assert!(ok && v["remote"].is_null(), "{v}");
+    until("it queues here", || proc_of(&status(&a), "cargo test")["awaits_slot"] == true);
+}
+
+#[test]
+fn a_queued_process_moves_to_the_remote_once_it_frees_up() {
+    let (a, b) = pair("reroute");
+    let repo = work_repo(&a, "proj", None);
+    let run = |args: &[&str]| a.collie_in(&repo, args);
+    let (ok, v) = b.collie_in(&b.0, &["exec", "--name", "busy", "--", "sleep", "60"]);
+    assert!(ok, "{v}");
+    until("A sees B busy", || status(&a)["builds"]["remote"]["running"] == 1);
+    assert!(run(&["exec", "--name", "hold", "--", "sleep", "60"]).0);
+    let (ok, v) = run(&["exec", "--name", "test-y", "--", "sh", "-c", "echo \"$COLLIE_STATE_DIR\""]);
+    assert!(ok && v["remote"].is_null(), "B is busy too: it queues here: {v}");
+    until("test-y queues here", || proc_of(&status(&a), "test-y")["awaits_slot"] == true);
+    assert!(b.collie_in(&b.0, &["stop", "busy"]).0);
+    let (ok, ended) = run(&["wait", "--until", "exited", "--timeout", "20000", "test-y"]);
+    assert_eq!((ok, &ended["state"]), (true, &"exited".into()), "{ended}");
+    assert!(ended["remote"]["id"].is_string(), "{ended}");
+    let out = lines(&a, "test-y");
+    let at = out.iter().position(|l| l.starts_with("collie: moved to remote")).unwrap_or_else(|| panic!("a moved record: {out:?}"));
+    assert!(out[at..].contains(&b.0.display().to_string()), "it ran on B: {out:?}");
+    assert!(!out.contains(&a.0.display().to_string()), "and never here: {out:?}");
+}
+
+#[test]
+fn without_the_remote_runs_stay_here_and_say_why() {
+    let (a, b) = pair("fallback");
+    let repo = work_repo(&a, "proj", None);
+    let run = |args: &[&str]| a.collie_in(&repo, args);
+    assert!(b.collie("t:p0", &["daemon", "stop"]).0);
+    until("A notices B is gone", || status(&a)["builds"]["remote"]["error"].as_str().is_some_and(|e| e.starts_with("unreachable")));
+    assert!(run(&["exec", "--name", "hold", "--", "sleep", "60"]).0);
+    let (ok, v) = run(&["exec", "--name", "test-f", "--", "true"]);
+    assert!(ok && v["remote"].is_null(), "{v}");
+    until("test-f queues here", || proc_of(&status(&a), "test-f")["awaits_slot"] == true);
+    assert!(lines(&a, "test-f").iter().any(|l| l.contains("takes no work now (unreachable")), "{:?}", lines(&a, "test-f"));
+    let (ok, err) = run(&["exec", "--remote", "--name", "test-g", "--", "true"]);
+    assert_eq!((ok, &err["error"]["code"]), (false, &"unavailable".into()), "{err}");
+}
+
+#[test]
+fn a_run_the_remote_refuses_runs_here_with_the_reason() {
+    let (a, b) = pair("refused");
+    let repo = work_repo(&a, "proj", None);
+    let run = |args: &[&str]| a.collie_in(&repo, args);
+    // Someone's own files where the copy would go: no copy of collie's, so it never syncs over them.
+    let theirs = b.0.join("mirror/proj");
+    std::fs::create_dir_all(&theirs).unwrap();
+    std::fs::write(theirs.join("notes.txt"), "mine").unwrap();
+    assert!(run(&["exec", "--name", "hold", "--", "sleep", "60"]).0);
+    let (ok, v) = run(&["exec", "--name", "test-r", "--", "true"]);
+    assert!(ok && v["remote"].is_null(), "{v}");
+    let out = lines(&a, "test-r");
+    assert!(out.iter().any(|l| l.starts_with("collie: couldn't run on remote") && l.contains("no copy of collie's") && l.ends_with("runs here")), "{out:?}");
+    // It stays here, although B is idle: it doesn't try again every sample.
+    until("test-r queues here", || proc_of(&status(&a), "test-r")["awaits_slot"] == true);
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(proc_of(&status(&a), "test-r")["remote"].is_null());
+    assert!(run(&["stop", "hold"]).0);
+    let (ok, ended) = run(&["wait", "--until", "exited", "--timeout", "15000", "test-r"]);
+    assert!(ok && ended["code"] == 0 && ended["remote"].is_null(), "{ended}");
+    assert_eq!(std::fs::read_dir(&theirs).unwrap().count(), 1, "their dir is as it was");
+}
+
+#[test]
+fn stopping_the_daemon_here_stops_its_runs_on_the_remote() {
+    let (a, b) = pair("stop-daemon");
+    let repo = work_repo(&a, "proj", None);
+    let (ok, v) = a.collie_in(&repo, &["exec", "--remote", "--name", "test-long", "--", "sleep", "300"]);
+    assert!(ok && v["remote"]["id"].is_string(), "{v}");
+    until("B runs test-long", || proc_of(&status(&b), "test-long")["state"] == "running");
+    assert!(a.collie("t:p0", &["daemon", "stop"]).0);
+    until("B stopped test-long", || proc_of(&status(&b), "test-long").is_null());
+    let there = &b.collie("t:p0", &["history", "--all", "test-long"]).1["runs"][0];
+    assert_eq!(there["state"], "crashed", "stopped, not ended on its own: {there}");
+}
+
+#[test]
+fn a_worktree_removed_here_is_deleted_on_the_remote_unless_something_runs_there() {
+    let (a, b) = pair("cleanup");
+    let (gone, busy) = (work_repo(&a, "gone", None), work_repo(&a, "busy", None));
+    let (ok, v) = a.collie_in(&gone, &["exec", "--remote", "--name", "test-a", "--", "true"]);
+    assert!(ok && v["remote"]["id"].is_string(), "{v}");
+    let (ok, v) = a.collie_in(&gone, &["wait", "--until", "exited", "--timeout", "20000", "test-a"]);
+    assert!(ok, "{v}");
+    let (ok, v) = a.collie_in(&busy, &["exec", "--remote", "--name", "test-b", "--", "sleep", "60"]);
+    assert!(ok && v["remote"]["id"].is_string(), "{v}");
+    let ledger = || std::fs::read_to_string(a.0.join("remote.json")).unwrap_or_default();
+    assert!(ledger().contains(gone.to_str().unwrap()) && ledger().contains(busy.to_str().unwrap()), "{}", ledger());
+    assert!(b.0.join("mirror/gone").is_dir() && b.0.join("mirror/busy").is_dir());
+    std::fs::remove_dir_all(&gone).unwrap();
+    std::fs::remove_dir_all(&busy).unwrap();
+    until("B's copy is deleted", || !b.0.join("mirror/gone").exists());
+    until("the ledger forgets it", || !ledger().contains(gone.to_str().unwrap()));
+    // Two samples more: test-b still runs in its copy.
+    std::thread::sleep(Duration::from_secs(11));
+    assert!(b.0.join("mirror/busy").is_dir() && ledger().contains(busy.to_str().unwrap()), "{}", ledger());
 }
