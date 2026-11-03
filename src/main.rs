@@ -1,3 +1,4 @@
+mod builds;
 mod daemon;
 mod eco;
 mod logs;

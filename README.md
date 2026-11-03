@@ -47,6 +47,8 @@ collie is the shared layer underneath:
 - **Physical iPhones and iPads** — signed builds, install and launch, with a queue when someone else holds the
   device.
 - **Throwaway Postgres and Redis** — one Docker container per dib, on a free port, deleted on release.
+- **Build slots** — only so many builds, `exec` commands and test runs at once; fewer while collie's own processes
+  use too much CPU or memory, with every build but the oldest slowed to background priority (never below one).
 - **History** — ended runs and their logs, kept 7 days.
 - **A terminal UI** — targets, tests, history, problems and live logs in one pane (`collie tui`), standalone
   or inside herdr.
@@ -176,6 +178,20 @@ cmd = "tuist generate --no-open"
 watch = ["Project.swift", "Tuist", "Package.swift", "Package.resolved"]
 ```
 
+Machine-wide limits live in `~/.config/collie/config.toml`, read again every 5 seconds, so an edit applies without
+restarting the daemon:
+
+```toml
+[builds]
+max = 2       # most builds at once; default: cores / 4, at least 1
+cpu = 70      # % of all cores collie's processes may use before the cap drops
+memory = 50   # % of RAM
+```
+
+Over a threshold for 10 s lowers the cap by one (never below 1) and moves every build but the oldest to background
+priority; 30 s under 80% of both raises it again. `collie status` shows the cap, the queue and each process's CPU
+and memory, summed over its whole process tree.
+
 | Environment variable | Effect |
 | --- | --- |
 | `COLLIE_HOLDER` | Who you are to collie, when you want separate ownership within one session |
@@ -215,8 +231,7 @@ Ideas being explored, not built yet:
 
 - **Remote execution** — run the daemon on another Mac (a Mac mini build box) and drive it from a laptop over SSH,
   with logs and status streaming back.
-- **CI as a collie client** — CI jobs join the same queue as agents, with priority.
-- **Build pressure limits** — cap concurrent builds by collie's own CPU and memory use, never below one.
+- **CI as a collie client** — CI jobs join the same build queue as agents, with priority.
 
 ## Development
 

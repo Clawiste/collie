@@ -1,3 +1,4 @@
+use crate::builds::{self, Slots, Usage};
 use crate::eco::{self, Ctx, Ecosystem, Level, Platform, Resource, Sim, SimKind, Source, Target};
 use crate::logs::{self, Filter, LogFile, Record};
 use anyhow::{Context, Result, bail, ensure};
@@ -353,7 +354,8 @@ impl Leases {
 #[serde(rename_all = "lowercase")]
 enum St {
     Building,
-    /// Waiting for a physical device another holder has, before its run phase; built already if it has a build.
+    /// Waiting for a physical device another holder has, before its run phase (built already if it has a build), or
+    /// for a build slot (`awaits_slot`).
     Queued,
     Running,
     Exited,
@@ -398,6 +400,10 @@ struct Proc {
     /// Its build problems' counts, `{"error", "warning", "lint"}` (the items are in `<id>.problems.json`); null for
     /// exec and a run stopped before it ended.
     problems: Option<Value>,
+    /// CPU and memory of its process and all its descendants at the last sample; null while no process runs.
+    usage: Option<Usage>,
+    /// Queued for a build slot (`builds`), not for a device.
+    awaits_slot: bool,
     /// Its run phase outlived its kill limit and is being killed; `finish` makes it `timed-out`. Not the state
     /// itself before then, which would count as ended while the process still lives.
     #[serde(skip)]
@@ -422,6 +428,7 @@ struct State {
     writing: HashSet<String>,
     /// When `prune` last started, Unix ms.
     pruned_at: u64,
+    slots: Slots,
 }
 
 struct Daemon {
@@ -432,6 +439,8 @@ struct Daemon {
     logs: PathBuf,
     /// `build_time()` at start.
     built: u64,
+    /// Woken on every `changed`, so a process queued for a build slot looks again.
+    wake: tokio::sync::Notify,
 }
 
 type D = Arc<Daemon>;
@@ -443,11 +452,12 @@ impl Daemon {
 
     fn snapshot(&self) -> Value {
         let st = self.lock();
-        json!({"processes": st.procs, "leases": st.leases.leases, "queue": st.leases.queue})
+        json!({"processes": st.procs, "leases": st.leases.leases, "queue": st.leases.queue, "builds": st.slots})
     }
 
     fn changed(&self) {
         let _ = self.tx.send(json!({"event": "status", "data": self.snapshot()}));
+        self.wake.notify_waiters();
     }
 
     fn log_path(&self, id: &str) -> PathBuf {
@@ -817,7 +827,59 @@ async fn prepare(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, dir: 
     Ok(())
 }
 
-/// Runs one phase; None if it could not spawn or the process was stopped meanwhile.
+/// A build slot process `.1` holds; given back on drop, so every way a phase ends frees it.
+struct Slot(D, String);
+
+impl Slot {
+    /// Queues `id` for a slot and waits its turn (state `queued`, `awaits_slot`); None when it was stopped meanwhile.
+    async fn take(d: &D, id: &str) -> Option<Slot> {
+        d.lock().slots.queued.push(id.into());
+        loop {
+            // Armed before looking, so a `changed` between the look and the await still wakes it.
+            let woken = d.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let (got, flipped) = {
+                let mut st = d.lock();
+                let State { procs, slots, .. } = &mut *st;
+                match procs.iter_mut().find(|p| p.id == id) {
+                    None => {
+                        slots.queued.retain(|q| q != id);
+                        (Some(None), true)
+                    }
+                    Some(p) if slots.may_start(id) => {
+                        slots.running.push(slots.queued.remove(0));
+                        p.awaits_slot = false;
+                        (Some(Some(Slot(d.clone(), id.into()))), true)
+                    }
+                    Some(p) if !p.awaits_slot => {
+                        // The last phase's group is gone: a stop while queued mustn't kill whatever reuses its pid.
+                        (p.state, p.pid, p.awaits_slot) = (St::Queued, None, true);
+                        (None, true)
+                    }
+                    Some(_) => (None, false),
+                }
+            };
+            if flipped {
+                d.changed();
+            }
+            if let Some(got) = got {
+                return got;
+            }
+            woken.await;
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.lock().slots.running.retain(|r| r != &self.1);
+        self.0.changed();
+    }
+}
+
+/// Runs one phase; None if it could not spawn or the process was stopped meanwhile. A build phase, and every phase of an
+/// exec or test run, first waits for a build slot.
 async fn exec(
     d: &D,
     id: &str,
@@ -839,6 +901,12 @@ async fn exec(
         cmd.env("PORT", p.to_string());
     }
     let (out, err) = if phase == St::Building { (Source::Build, Source::Build) } else { (Source::Stdout, Source::Stderr) };
+    let kind = d.lock().procs.iter().find(|p| p.id == id).map(|p| p.kind.clone());
+    // An app's or server's run phase holds none: it may run for hours, and its CPU isn't a build's.
+    let _slot = match phase == St::Building || matches!(kind.as_deref(), Some("exec" | "test")) {
+        true => Some(Slot::take(d, id).await?),
+        false => None,
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(x) => {
@@ -2260,6 +2328,8 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
                     only: !only.is_empty(),
                     branch: branch.clone(),
                     problems: None,
+                    usage: None,
+                    awaits_slot: false,
                     timed_out: false,
                     t: t.clone(),
                 })
@@ -2374,6 +2444,12 @@ async fn wait(d: &D, cwd: &Path, target: Option<&str>, holder: &str, until: &str
             let last = last.map_or("—".to_string(), |r| r.line.lines().next().unwrap_or_default().chars().take(160).collect());
             let state = json!(p.state);
             let elapsed = crate::tui::ago(now_ms().saturating_sub(p.since));
+            if p.awaits_slot {
+                let st = d.lock();
+                let names: Vec<&str> = st.slots.running.iter().filter_map(|r| st.procs.iter().find(|p| &p.id == r)).map(|p| p.target.as_str()).collect();
+                let why = format!("{} of {} build slots busy: {}", st.slots.running.len(), st.slots.cap, names.join(", "));
+                bail!(coded("timeout", format!("{id} still queued for a build slot ({why}; {elapsed} elapsed); it keeps running: wait again")));
+            }
             if let (St::Queued, Some(dev)) = (p.state, &p.device) {
                 let behind = d.lock().leases.device_lease(&dev.udid).map_or("—".to_string(), |l| who(&l.holder, &l.agent));
                 bail!(coded("timeout", format!("{id} still queued for {} behind {behind} ({elapsed} elapsed); it keeps running: wait again", dev.name)));
@@ -2918,6 +2994,51 @@ async fn drain_retirements(d: &D) {
     }
 }
 
+/// Every `builds::EVERY_MS`: each live process's usage, and collie's total into the build-slot cap. While the cap is
+/// lowered for pressure, builds beyond the oldest run at background priority, so the oldest always runs at full speed.
+async fn watch_builds(d: D) {
+    let path = builds::config_path();
+    let mut slowed = false;
+    loop {
+        sleep(Duration::from_millis(builds::EVERY_MS)).await;
+        let (p, cores) = (path.clone(), d.lock().slots.cores);
+        let Ok((rows, (knobs, err))) = tokio::task::spawn_blocking(move || (builds::sample(), builds::knobs(&p, cores))).await else { continue };
+        let (priorities, live) = {
+            let mut st = d.lock();
+            let State { procs, slots, .. } = &mut *st;
+            let (mut total, mut trees) = (Usage::default(), HashMap::new());
+            for p in procs.iter_mut() {
+                p.usage = p.pid.map(|pid| {
+                    let tree = builds::tree(&rows, pid);
+                    let u = builds::usage(&rows, &tree);
+                    trees.insert(p.id.clone(), tree);
+                    u
+                });
+                (total.cpu, total.mem) = (total.cpu + p.usage.map_or(0.0, |u| u.cpu), total.mem + p.usage.map_or(0, |u| u.mem));
+            }
+            let before = (slots.cap, slots.slowed);
+            slots.config_error = err;
+            slots.step(knobs, total);
+            let live = !trees.is_empty() || before != (slots.cap, slots.slowed);
+            // Every sample while slowed: compilers start all the time, and the oldest changes as builds end.
+            let priorities: Vec<(Vec<u32>, bool)> = match slots.slowed || slowed {
+                true => slots.running.iter().enumerate().filter_map(|(i, id)| Some((trees.remove(id)?, slots.slowed && i > 0))).collect(),
+                false => vec![],
+            };
+            slowed = slots.slowed;
+            (priorities, live)
+        };
+        for (pids, bg) in priorities {
+            for pid in pids {
+                background(pid, bg);
+            }
+        }
+        if live {
+            d.changed();
+        }
+    }
+}
+
 async fn expire_leases(d: D) {
     loop {
         sleep(Duration::from_secs(1)).await;
@@ -2930,7 +3051,21 @@ async fn expire_leases(d: D) {
 // From libc, which std has no stable wrapper for (`CommandExt::setsid` is unstable).
 unsafe extern "C" {
     fn setsid() -> i32;
+    #[cfg(target_os = "macos")]
+    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
 }
+
+/// Moves `pid` to macOS background priority (slower CPU and I/O, yielding to everything else), or back out of it.
+#[cfg(target_os = "macos")]
+fn background(pid: u32, on: bool) {
+    // <sys/resource.h>: PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG. Unlike a raised nice, an unprivileged user can undo it.
+    // SAFETY: a plain syscall on a pid; a gone or foreign pid only fails it.
+    unsafe { setpriority(4, pid, if on { 0x1000 } else { 0 }) };
+}
+
+// ponytail: no slowdown on Linux, where an unprivileged user can raise a nice value but never lower it back.
+#[cfg(not(target_os = "macos"))]
+fn background(_: u32, _: bool) {}
 
 /// Blocks until no daemon holds `daemon.lock`, up to 20 s: a stopped daemon answers first, then drains (simulators,
 /// containers) before it exits, and a command starting one meanwhile would lose the lock to it and fail.
@@ -3006,14 +3141,20 @@ async fn serve(dir: PathBuf, sock: PathBuf, _lock: File) -> Result<()> {
     if old_logs != logs_dir() && old_logs.is_dir() {
         let _ = std::fs::remove_dir_all(&old_logs);
     }
+    let (cores, ram) = builds::machine();
+    let (knobs, config_error) = builds::knobs(&builds::config_path(), cores);
+    let mut slots = Slots::new(knobs, cores, ram);
+    slots.config_error = config_error;
     let d = Arc::new(Daemon {
-        st: Mutex::new(State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0 }),
+        st: Mutex::new(State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0, slots }),
         tx: broadcast::channel(1024).0,
         dir,
         logs: logs_dir(),
         built: build_time(),
+        wake: Default::default(),
     });
     prune_soon(&d);
+    tokio::spawn(watch_builds(d.clone()));
     tokio::spawn(retire_sims(d.clone(), rx));
     tokio::spawn(remove_containers(d.clone(), containers));
     // Containers of this daemon's label that no surviving lease holds; free-standing dibs survive a restart, and so do
@@ -3109,7 +3250,7 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_runs_results_drop_no_tests() {
         let logs = scratch();
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: Leases::default(), stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: Leases::default(), stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0, wake: Default::default() });
         let mut log = LogFile::open(&logs.join("stopped.log")).unwrap();
         log.append(&Record { ts: 0, source: Source::Stdout, level: Level::Info, line: "test tests::a ... ok".into() });
         let t = Target { name: "cargo test".into(), ecosystem: "cargo".into(), dir: "/w".into(), kind: "test".into(), package: None, needs_port: false, port: None, target_dir: None };
@@ -3239,7 +3380,7 @@ mod tests {
         assert_eq!(build_problems(&recs, &root, &root, false).len(), 3, "a task without a build: all its output");
         // Stopped: the process is gone by the time its problems would be saved.
         let logs = scratch();
-        let d: D = Arc::new(Daemon { st: Mutex::new(state(Leases::default())), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(state(Leases::default())), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0, wake: Default::default() });
         let t = Target { name: "app".into(), ecosystem: "xcode".into(), dir: root.clone(), kind: "app".into(), package: None, needs_port: false, port: None, target_dir: None };
         save_problems(&d, "gone", &t, true).await;
         assert!(!logs.join("gone.problems.json").exists());
@@ -3416,7 +3557,7 @@ mod tests {
         assert_eq!((&v["resource"], &v["simulator"]["name"], v.get("port")), (&json!("simulator"), &json!(format!("collie {id}")), None));
 
         let p = my_app("APP-1", vec![port.id, s.id], &s, true);
-        let mut st = State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let mine = |h: &'static str| move |p: &Proc| p.target == "MyApp" && p.holder == h;
         assert!(carry(&mut st, mine("w1:p2"), sim_fits(&kind("iPhone 18 Pro"), &None)).is_none(), "another holder gets a fresh device");
         assert!(carry(&mut st, mine("w1:p1"), sim_fits(&kind("iPhone 17 Pro"), &None)).is_none(), "a changed kind gets a fresh device");
@@ -3445,7 +3586,7 @@ mod tests {
         let mut building = my_app("APP-1", vec![failed.id], &failed, false);
         building.state = St::Building;
         let running = my_app("APP-2", vec![exited.id], &exited, true);
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building, running], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building, running], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         use std::os::unix::process::ExitStatusExt;
         finish(&d, "APP-1", Some(ExitStatus::from_raw(1 << 8)));
         finish(&d, "APP-2", Some(ExitStatus::from_raw(0)));
@@ -3473,7 +3614,7 @@ mod tests {
         };
         let procs = vec![test("F-1", "ListCoreTests", &running, St::Running), test("D-1", "SyncCoreTests", &ended, St::Exited)];
         let t = procs[0].t.clone();
-        let mut st = State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let k = kind("iPhone 18 Pro");
         let fits = || sim_fits(&k, &None);
         let search = Target { name: "SearchCoreTests".into(), ..t.clone() };
@@ -3510,7 +3651,7 @@ mod tests {
             p
         };
         let procs = vec![test("T-1", &failed, false), test("T-2", &hung, true)];
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         use std::os::unix::process::ExitStatusExt;
         finish(&d, "T-1", Some(ExitStatus::from_raw(65 << 8)));
         finish(&d, "T-2", Some(ExitStatus::from_raw(15)));
@@ -3607,7 +3748,7 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/template-fail");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(16).0, dir: dir.clone(), logs: dir.join("logs"), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(16).0, dir: dir.clone(), logs: dir.join("logs"), built: 0, wake: Default::default() });
         let e = save_template(&d, &t, "w1:p1", &HashMap::new()).await.unwrap_err().to_string();
         assert!(e.contains(&format!("kept as dibs {id}")), "{e}");
         let st = d.lock();
@@ -3623,7 +3764,7 @@ mod tests {
     }
 
     fn state(leases: Leases) -> State {
-        State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0 }
+        State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }
     }
 
     #[test]
@@ -3670,7 +3811,7 @@ mod tests {
         // Released during a-1's build: handed to it, though it doesn't take it (`adopt`) until its run phase.
         st.leases.release(held.id, 0);
         assert_eq!(st.leases.device_lease(&phone().udid).and_then(|l| l.process.clone()).as_deref(), Some("a-1"));
-        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         finish(&d, "a-1", None); // its build failed
         assert_eq!(d.lock().leases.device_lease(&phone().udid).and_then(|l| l.process.clone()).as_deref(), Some("b-1"), "back, to the next in line");
         stop_where(&d, |p| p.id == "b-1").await; // stopped mid-build
@@ -3694,7 +3835,7 @@ mod tests {
             p.state = St::Queued;
             st.procs.push(p);
         }
-        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         finish(&d, "a-1", None); // its build failed
         stop_where(&d, |p| p.id == "b-1").await;
         assert!(d.lock().leases.queue.is_empty());
@@ -3772,7 +3913,7 @@ mod tests {
         let mut ls = Leases::default();
         let id = ls.reserve();
         let l = ls.grant(id, "w1:p1", None, None, None, Some(phone()), true, 0);
-        let mut st = State { procs: vec![my_app("APP-1", vec![l.id], &l, true)], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs: vec![my_app("APP-1", vec![l.id], &l, true)], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let same = |p: &Proc| p.target == "MyApp";
         let code = |r: Result<Lease>| r.unwrap_err().downcast_ref::<Coded>().unwrap().0.clone();
         assert_eq!(code(lease_device(&mut st, same, "w1:p2", None, false, &phone(), "MyApp")), "busy");
@@ -3794,7 +3935,7 @@ mod tests {
         let mut ls = Leases::default();
         let held = ls.acquire("w1:p1", None, None, false, Some(phone()), 0).unwrap();
         assert!(!held.run);
-        let mut st = State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let same = |p: &Proc| p.target == "MyApp";
         let code = |r: Result<Lease>| r.unwrap_err().downcast_ref::<Coded>().unwrap().0.clone();
         assert_eq!(code(lease_device(&mut st, same, "w1:p2", None, true, &phone(), "MyApp")), "busy", "take doesn't take a free-standing lease");
@@ -3831,7 +3972,7 @@ mod tests {
         let (_, mut rx) = ls.enqueue("w1:p2", None, None, Some(phone()), None, 0);
         let mut building = my_app("APP-1", vec![l.id], &l, false);
         building.state = St::Building;
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         use std::os::unix::process::ExitStatusExt;
         finish(&d, "APP-1", Some(ExitStatus::from_raw(1 << 8)));
         assert_eq!(rx.try_recv().unwrap().holder, "w1:p2", "unlike a simulator, it doesn't stay with the ended process");
@@ -3845,7 +3986,7 @@ mod tests {
         let mut port_only = my_app("NODE-1", vec![], &l, false);
         port_only.device = None;
         let procs = vec![my_app("APP-1", vec![l.id], &l, false), port_only];
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         let log = Mutex::new(LogFile::open(&tmp.join("device-launched.log")).unwrap());
@@ -3863,7 +4004,7 @@ mod tests {
         let l = ls.grant(id, "w1:p1", None, None, None, None, true, 0);
         let mut p = my_app("TASK-1", vec![], &l, false);
         p.device = None;
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         let log = Mutex::new(LogFile::open(&tmp.join("lock-wait.log")).unwrap());
@@ -3950,6 +4091,8 @@ mod tests {
             only: false,
             branch: None,
             problems: None,
+            usage: None,
+            awaits_slot: false,
             timed_out: false,
             t,
         }
@@ -4027,7 +4170,7 @@ mod tests {
         let l = ls.grant(id, "w1:p1", None, None, None, None, true, 0);
         let mut p = my_app("TOY-1", vec![], &l, false);
         (p.kind, p.device) = ("test".into(), None);
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         let log = Mutex::new(LogFile::open(&scratch().join("toy.log")).unwrap());
         exec(&d, "TOY-1", &log, &Toy, Toy.run(&t, &Ctx::default()), &HashMap::new(), None, St::Running).await;
         let tests = d.lock().procs[0].tests.clone().unwrap();
@@ -4068,7 +4211,7 @@ mod tests {
         let kind = ToyPlatform.resolve(&[], &Value::Null, None, None).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ls = Leases { retire: Some(tx), ..Default::default() };
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         // A template of the same kind: the default clone refuses, so the device is created instead.
         let tm = Sim { udid: "TMPL".into(), name: "t".into(), device: kind.device_name.clone(), runtime: kind.runtime_name.clone(), slim: None, platform: "toy".into() };
         let (l, note, slimmed) = new_sim(&d, &ToyPlatform, "w1:p1", None, kind.clone(), false, None, Some(tm.clone()), Some(vec![])).await.unwrap();

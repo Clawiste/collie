@@ -116,6 +116,31 @@ watch = ["src"]
 }
 
 #[test]
+fn builds_beyond_the_cap_queue_for_a_slot_in_arrival_order() {
+    let d = Daemon::new("build-slots");
+    std::fs::write(d.0.join("config.toml"), "[builds]\nmax = 1\n").unwrap();
+    let (ok, a) = d.collie("t:p1", &["exec", "--name", "a", "--", "sleep", "2"]);
+    assert!(ok, "{a}");
+    let (ok, b) = d.collie("t:p1", &["exec", "--name", "b", "--", "true"]);
+    assert!(ok, "{b}");
+    let b_id = b["id"].as_str().unwrap();
+    let (_, status) = d.collie("t:p1", &["status"]);
+    let proc_b = status["processes"].as_array().unwrap().iter().find(|p| p["id"] == b_id).unwrap();
+    assert_eq!((&proc_b["state"], &proc_b["awaits_slot"]), (&"queued".into(), &true.into()), "{status}");
+    assert_eq!(status["builds"]["cap"], 1, "{status}");
+    assert_eq!(status["builds"]["queued"], serde_json::json!([b_id]), "{status}");
+    let (ok, err) = d.collie("t:p1", &["wait", "--until", "exited", "--timeout", "300", "b"]);
+    assert!(!ok);
+    assert!(err["error"]["message"].as_str().unwrap().contains("still queued for a build slot (1 of 1 build slots busy: a"), "{err}");
+    let (ok, b) = d.collie("t:p1", &["wait", "--until", "exited", "--timeout", "15000", "b"]);
+    assert!(ok, "{b}");
+    let (_, status) = d.collie("t:p1", &["status"]);
+    let proc_a = status["processes"].as_array().unwrap().iter().find(|p| p["target"] == "a").unwrap();
+    assert!(proc_a["ended_at"].as_u64() <= b["ended_at"].as_u64(), "b ran only after a ended: {status}");
+    assert_eq!(status["builds"]["running"], serde_json::json!([]), "both gave their slot back: {status}");
+}
+
+#[test]
 fn logs_all_reads_a_whole_run_and_a_cursor_from_an_old_run_warns() {
     let d = Daemon::new("logs-all");
     let (ok, started) = d.collie("t:p1", &["exec", "--name", "many", "--", "sh", "-c", "seq 300"]);

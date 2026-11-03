@@ -2283,7 +2283,11 @@ impl App {
                     Some(end) => format!("  took {}", ago(end.saturating_sub(since))).dim(),
                     None => format!("  up {}", ago(now_ms().saturating_sub(since))).dim(),
                 });
-                if p["state"] == "queued" {
+                if p["awaits_slot"] == true {
+                    let b = &self.status["builds"];
+                    let busy = b["running"].as_array().map_or(0, Vec::len);
+                    info.push(format!("  queued for a build slot ({busy} of {} busy)", b["cap"]).yellow());
+                } else if p["state"] == "queued" {
                     let udid = &p["device"]["udid"];
                     let lease = self.status["leases"].as_array().into_iter().flatten().find(|l| &l["device"]["udid"] == udid);
                     let behind = lease.map_or(String::new(), |l| format!(" behind {}", who(text(&l["holder"]), &l["agent"].as_str().map(Into::into))));
