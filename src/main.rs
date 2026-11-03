@@ -237,11 +237,22 @@ enum SimsCmd {
 
 #[derive(Subcommand)]
 enum LeaseCmd {
-    /// A port, a fresh simulator device (deleted on release), a physical device, or a throwaway database container
-    /// (postgres, redis; deleted on release) whose `service.url` the result gives
+    /// A port, a fresh simulator device (deleted on release), a physical device, a throwaway database container
+    /// (postgres, redis; deleted on release) whose `service.url` the result gives, or a build slot for a process
+    /// collie doesn't run (a CI job; agents never need one)
     Acquire {
-        #[arg(value_parser = ["port", "simulator", "device", "postgres", "redis"])]
+        #[arg(value_parser = ["port", "simulator", "device", "postgres", "redis", "build"])]
         resource: String,
+        /// For `build` (required): the process holding the slot; its tree counts toward the limits, and its exit
+        /// releases the dibs
+        #[arg(long)]
+        pid: Option<u32>,
+        /// For `build`: queue ahead of every build without a priority
+        #[arg(long, value_parser = ["ci"])]
+        priority: Option<String>,
+        /// For `build`: how the dibs show in status and the pane
+        #[arg(long)]
+        name: Option<String>,
         /// Docker image for postgres or redis (default postgres:17, redis:7)
         #[arg(long)]
         image: Option<String>,
@@ -260,7 +271,13 @@ enum LeaseCmd {
         #[arg(long)]
         runtime: Option<String>,
     },
-    Release { id: u64 },
+    Release {
+        #[arg(required_unless_present = "pid")]
+        id: Option<u64>,
+        /// The build dibs this process holds, instead of an id
+        #[arg(long, conflicts_with = "id")]
+        pid: Option<u32>,
+    },
     /// Extend its TTL (2h) from now
     Renew { id: u64 },
     List,
@@ -452,11 +469,12 @@ fn run(cli: &Cli) -> Result<()> {
             }
         },
         Cmd::Lease { cmd } => out(match cmd {
-            LeaseCmd::Acquire { resource, image, preferred, wait, timeout, device, runtime } => request(
+            LeaseCmd::Acquire { resource, pid, priority, name, image, preferred, wait, timeout, device, runtime } => request(
                 "lease.acquire",
-                json!({"resource": resource, "image": image, "preferred": preferred, "wait": wait, "timeout_ms": timeout, "device": device, "runtime": runtime}),
+                json!({"resource": resource, "pid": pid, "priority": priority, "name": name, "image": image, "preferred": preferred, "wait": wait, "timeout_ms": timeout,
+                    "device": device, "runtime": runtime}),
             )?,
-            LeaseCmd::Release { id } => request("lease.release", json!({"id": id}))?,
+            LeaseCmd::Release { id, pid } => request("lease.release", json!({"id": id, "pid": pid}))?,
             LeaseCmd::Renew { id } => request("lease.renew", json!({"id": id}))?,
             LeaseCmd::List => request("lease.list", json!({}))?,
         }),
@@ -516,6 +534,11 @@ pub fn send_with(method: &str, mut params: Value, start: bool) -> Result<impl It
     let mut s = match UnixStream::connect(daemon::socket_path()) {
         Ok(s) => s,
         Err(e) if !start => return Err(e.into()),
+        // Set in a GitHub Actions job: a daemon started here would be the job's child, which the runner kills (and
+        // with it every process the daemon runs) when the job ends or is cancelled.
+        Err(_) if std::env::var_os("RUNNER_TRACKING_ID").is_some() => {
+            return Err(coded("unavailable", "no collie daemon is running, and a CI job doesn't start one: run it as a LaunchAgent (README, CI)"));
+        }
         Err(_) => {
             daemon::start(false)?;
             UnixStream::connect(daemon::socket_path())?

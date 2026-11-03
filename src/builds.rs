@@ -1,8 +1,9 @@
-//! Build slots: how many builds (build steps, `exec` commands, test runs) collie runs at once. The cap drops while
-//! collie's own processes use too much CPU or memory, and climbs back once they don't; it never drops below one.
+//! Build slots: how many builds (build steps, `exec` commands, test runs, CI jobs holding a build dib) run at once. The
+//! cap drops while the slot holders' processes use too much CPU or memory, and climbs back once they don't; it never
+//! drops below one.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Samples this far apart; the controller's counts below are in samples.
@@ -19,9 +20,9 @@ const UNDER: u32 = 6;
 pub struct Knobs {
     /// Most builds at once.
     pub max: usize,
-    /// Percent of all cores collie's processes may use together.
+    /// Percent of all cores the slot holders' processes may use together.
     pub cpu: f64,
-    /// Percent of RAM collie's processes may use together.
+    /// Percent of RAM the slot holders' processes may use together.
     pub memory: f64,
 }
 
@@ -137,16 +138,19 @@ pub struct Slots {
     pub knobs: Knobs,
     pub cores: usize,
     pub ram: u64,
-    /// collie's processes together, at the last sample.
+    /// collie's processes and the build dibs' together, at the last sample.
     pub usage: Usage,
-    /// Builds beyond the oldest run at background priority until the pressure is gone.
+    /// Every slot holder but one (the oldest CI holder, else the oldest) runs at background priority until the
+    /// pressure is gone.
     pub slowed: bool,
     /// Holding a slot, oldest first.
     pub running: Vec<String>,
-    /// Waiting for one, in arrival order.
+    /// Waiting for one: prioritised entries first, each group in arrival order.
     pub queued: Vec<String>,
     /// Why the config file was ignored, if it was.
     pub config_error: Option<String>,
+    #[serde(skip)]
+    prioritised: HashSet<String>,
     #[serde(skip)]
     over: u32,
     #[serde(skip)]
@@ -162,7 +166,7 @@ impl Default for Slots {
 
 impl Slots {
     pub fn new(knobs: Knobs, cores: usize, ram: u64) -> Self {
-        Slots { cap: knobs.max, knobs, cores, ram, usage: Usage::default(), slowed: false, running: vec![], queued: vec![], config_error: None, over: 0, under: 0 }
+        Slots { cap: knobs.max, knobs, cores, ram, usage: Usage::default(), slowed: false, running: vec![], queued: vec![], config_error: None, prioritised: HashSet::new(), over: 0, under: 0 }
     }
 
     /// Whether `id`, queued, may take a slot now: one is free and nobody queued before it.
@@ -170,7 +174,24 @@ impl Slots {
         self.running.len() < self.cap && self.queued.first().is_some_and(|q| q == id)
     }
 
-    /// Takes in one sample of collie's total usage, under (possibly new) knobs.
+    /// Queues `id` last; with `first`, ahead of every entry queued without it but behind those queued with it.
+    pub fn enqueue(&mut self, id: String, first: bool) {
+        let at = match first {
+            true => self.queued.iter().take_while(|q| self.prioritised.contains(*q)).count(),
+            false => self.queued.len(),
+        };
+        if first {
+            self.prioritised.insert(id.clone());
+        }
+        self.queued.insert(at, id);
+    }
+
+    pub fn leave(&mut self, id: &str) {
+        self.queued.retain(|q| q != id);
+        self.prioritised.remove(id);
+    }
+
+    /// Takes in one sample of the slot holders' total usage, under (possibly new) knobs.
     pub fn step(&mut self, knobs: Knobs, usage: Usage) {
         self.knobs = knobs;
         self.usage = usage;
@@ -271,6 +292,24 @@ mod tests {
         assert!(s.may_start("a") && !s.may_start("b"));
         s.running.push(s.queued.remove(0));
         assert!(!s.may_start("b"), "the one slot is taken");
+    }
+
+    #[test]
+    fn a_prioritised_entry_goes_ahead_of_waiting_ones_but_behind_earlier_prioritised_ones() {
+        let mut s = Slots::new(knobs(1), 4, GB);
+        s.running = vec!["agent".into()];
+        for (id, first) in [("a", false), ("ci1", true), ("b", false), ("ci2", true)] {
+            s.enqueue(id.into(), first);
+        }
+        assert_eq!(s.queued, ["ci1", "ci2", "a", "b"]);
+        assert_eq!(s.running, ["agent"], "a running holder is never displaced");
+        assert!(!s.may_start("ci1"), "and keeps its slot until it ends");
+        s.running.clear();
+        assert!(s.may_start("ci1"));
+        s.leave("ci1");
+        s.running.push("ci1".into());
+        s.enqueue("ci3".into(), true);
+        assert_eq!(s.queued, ["ci2", "ci3", "a", "b"], "one that left is no longer counted among the prioritised");
     }
 
     #[test]

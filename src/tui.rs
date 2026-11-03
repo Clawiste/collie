@@ -2218,6 +2218,7 @@ impl App {
             let age = ago(now.saturating_sub(l["acquired_at"].as_u64().unwrap_or(now)));
             let sim = if l["device"].is_object() { &l["device"] } else { &l["simulator"] };
             let what = match (sim["name"].as_str(), l["service"].is_object()) {
+                _ if l["resource"] == "build" => format!("{} ", l["name"].as_str().unwrap_or("build slot")),
                 (Some(name), _) => format!("{name} "),
                 (None, true) => format!("{} :{} ", text(&l["resource"]), l["port"]),
                 (None, false) => format!(":{} ", l["port"]),
@@ -2232,6 +2233,7 @@ impl App {
         }
         for w in self.status["queue"].as_array().into_iter().flatten() {
             let want = match (w["device"]["name"].as_str(), w["preferred"].as_u64()) {
+                _ if w["resource"] == "build" => format!("a build slot{}", w["name"].as_str().map_or(String::new(), |n| format!(" ({n})"))),
                 (Some(name), _) => name.to_string(),
                 (None, Some(p)) => format!(":{p}"),
                 (None, None) => "any port".into(),

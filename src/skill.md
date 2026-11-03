@@ -121,8 +121,13 @@ build slot, an app's or server's run phase doesn't. With every slot taken, a pro
 `"awaits_slot": true` and starts when one frees up, in arrival order. `wait` waits through it; its timeout line says
 `still queued for a build slot (2 of 2 build slots busy: <targets>…)`.
 
-- The cap drops (never below 1) while collie's processes use too much CPU or memory, and climbs back once they
-  don't. While it's lowered, every build but the oldest runs at background priority: slower, never stopped.
+- CI jobs on this machine hold build slots too, as build dibs (`resource: "build"`, holder `ci`, with `pid` and
+  `name`; in `builds.running` as `dibs:<id>`). They queue ahead of your builds and never preempt a running one.
+  Don't call `dibs acquire build` yourself: collie takes the slot for everything it runs.
+- A build dib ends when its `pid` exits or it is released, not with the 2h TTL (its `expires_at` isn't enforced).
+- The cap drops (never below 1) while the slot holders' processes use too much CPU or memory, and climbs back once
+  they don't. While it's lowered, every build but one runs at background priority: slower, never stopped. The one at
+  full speed is the oldest CI job, else the oldest build.
 - Don't work around a queue (running the build in your own shell, or stopping someone's build). Wait for it.
 - `collie status --json` shows `builds` (`cap`, `running`, `queued`, `usage`, `slowed`, `knobs`), and each process's
   `usage` (`cpu` in percent of one core, summed over its process tree; `mem` in bytes).

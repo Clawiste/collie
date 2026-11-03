@@ -89,7 +89,7 @@ pub fn port_open(port: u16) -> bool {
 
 // ---- leases
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Lease {
     pub id: u64,
     pub holder: String,
@@ -105,7 +105,19 @@ pub struct Lease {
     /// A throwaway database container (`postgres`, `redis`); `port` is its host port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<Service>,
+    /// A build dib's process, which collie doesn't run: its tree is measured, and its exit releases the dib.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// When `pid` started (`started`), so a restart doesn't seat a reused pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_started: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `ci`: queued for a build slot ahead of every build without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     pub acquired_at: u64,
+    /// Not enforced for a build dib, which lasts as long as its `pid`.
     pub expires_at: u64,
     /// Held by a process `run` started; dropped when the daemon starts, since processes don't outlive it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -133,6 +145,13 @@ pub struct Waiter {
     pub resource: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<Sim>,
+    /// A build dib's, as on `Lease`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     pub preferred: Option<u16>,
     pub since: u64,
     /// The process queued for the device (`run`'s `queue`); none for `dibs acquire --wait`.
@@ -249,7 +268,7 @@ impl Leases {
         if let Some(s) = &simulator {
             self.devices.push(s.key());
         }
-        let l = Lease { id, holder: holder.into(), agent, resource, port, simulator, device, service: None, acquired_at: now, expires_at: now + TTL_MS, run, process: None };
+        let l = Lease { id, holder: holder.into(), agent, resource, port, simulator, device, acquired_at: now, expires_at: now + TTL_MS, run, ..Default::default() };
         self.leases.push(l.clone());
         self.save();
         l
@@ -275,13 +294,18 @@ impl Leases {
         let id = self.next;
         self.next += 1;
         let resource = if device.is_some() { "device" } else { "port" }.into();
-        self.queue.push(Waiter { id, holder: holder.into(), agent, resource, device, preferred, since: now, process, tx: Some(tx) });
+        self.queue.push(Waiter { id, holder: holder.into(), agent, resource, device, pid: None, name: None, priority: None, preferred, since: now, process, tx: Some(tx) });
         (id, rx)
     }
 
     fn hand_to_waiters(&mut self, now: u64) {
         let mut i = 0;
         while i < self.queue.len() {
+            // A build slot is `Slots`' to give (`build_dib`), never a port.
+            if self.queue[i].resource == "build" {
+                i += 1;
+                continue;
+            }
             let fits = match &self.queue[i].device {
                 Some(dev) => self.device_lease(&dev.udid).is_none().then_some(None),
                 None => self.pick(self.queue[i].preferred, true).map(Some),
@@ -330,8 +354,9 @@ impl Leases {
         self.remove(|l| l.id == id, now)
     }
 
+    /// Drops leases past their TTL; a build dib ends with its pid instead (`watch_builds`).
     pub fn expire(&mut self, now: u64) -> Vec<Lease> {
-        self.remove(|l| l.expires_at <= now, now)
+        self.remove(|l| l.pid.is_none() && l.expires_at <= now, now)
     }
 
     pub fn release_holder(&mut self, holder: &str, now: u64) -> Vec<Lease> {
@@ -603,6 +628,17 @@ fn survivors(groups: &[(u32, String)], started: impl Fn(u32) -> Option<String>) 
     groups.iter().filter(|(g, at)| started(*g).as_ref() == Some(at)).map(|(g, _)| *g).collect()
 }
 
+/// At start: build dibs whose pid still runs as the process recorded take their slots back, oldest first (possibly
+/// past the cap, which then holds the queue until they end); the rest ended while the daemon was down and go.
+fn seat_build_dibs(leases: &mut Leases, slots: &mut Slots, started: impl Fn(u32) -> Option<String>) {
+    let held: Vec<(u32, String)> = leases.leases.iter().filter_map(|l| Some((l.pid?, l.pid_started.clone()?))).collect();
+    let live = survivors(&held, started);
+    leases.remove(|l| l.resource == "build" && !l.pid.is_some_and(|p| live.contains(&p)), now_ms());
+    let mut seated: Vec<&Lease> = leases.leases.iter().filter(|l| l.resource == "build").collect();
+    seated.sort_by_key(|l| l.acquired_at);
+    slots.running = seated.iter().map(|l| format!("dibs:{}", l.id)).collect();
+}
+
 /// Removes matching processes, records the live ones in the history, releases their leases and kills their process
 /// groups.
 async fn stop_where(d: &D, pred: impl Fn(&Proc) -> bool) -> Vec<String> {
@@ -634,9 +670,24 @@ async fn stop_where(d: &D, pred: impl Fn(&Proc) -> bool) -> Vec<String> {
     gone.into_iter().map(|p| p.id).collect()
 }
 
-/// Drops leases (released, expired, holder gone) and stops the processes that held them.
+/// Drops leases (released, expired, holder gone, a build dib's pid gone), frees the build slots of build dibs among
+/// them, and stops the processes that held them.
 async fn drop_leases(d: &D, f: impl FnOnce(&mut Leases) -> Vec<Lease>) -> Vec<Lease> {
-    let gone = f(&mut d.lock().leases);
+    let gone = {
+        let mut st = d.lock();
+        let gone = f(&mut st.leases);
+        st.slots.running.retain(|r| !gone.iter().any(|l| *r == format!("dibs:{}", l.id)));
+        gone
+    };
+    // Out of background priority: with its slot gone, no later sample would reset a job that runs on.
+    let pids: Vec<u32> = gone.iter().filter_map(|l| l.pid).collect();
+    if !pids.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || {
+            let rows = builds::sample();
+            pids.iter().flat_map(|&pid| builds::tree(&rows, pid)).for_each(|p| background(p, false));
+        })
+        .await;
+    }
     if !gone.is_empty() {
         let ids: Vec<u64> = gone.iter().map(|l| l.id).collect();
         stop_where(d, |p| p.leases.iter().any(|id| ids.contains(id))).await;
@@ -2413,6 +2464,16 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
     Ok(v)
 }
 
+/// Who holds each build slot: a process's target, or a build dib's name (else its holder).
+fn slot_holders(st: &State) -> Vec<String> {
+    let dib = |id: &str| st.leases.leases.iter().find(|l| l.id.to_string() == id).map(|l| l.name.clone().unwrap_or_else(|| l.holder.clone()));
+    let named = |r: &String| match r.strip_prefix("dibs:") {
+        Some(id) => dib(id),
+        None => st.procs.iter().find(|p| &p.id == r).map(|p| p.target.clone()),
+    };
+    st.slots.running.iter().filter_map(named).collect()
+}
+
 async fn wait(d: &D, cwd: &Path, target: Option<&str>, holder: &str, until: &str, timeout: Option<u64>) -> Result<Value> {
     let id = newest(d, cwd, target, holder)?;
     let deadline = timeout.map(|ms| Instant::now() + Duration::from_millis(ms));
@@ -2446,8 +2507,7 @@ async fn wait(d: &D, cwd: &Path, target: Option<&str>, holder: &str, until: &str
             let elapsed = crate::tui::ago(now_ms().saturating_sub(p.since));
             if p.awaits_slot {
                 let st = d.lock();
-                let names: Vec<&str> = st.slots.running.iter().filter_map(|r| st.procs.iter().find(|p| &p.id == r)).map(|p| p.target.as_str()).collect();
-                let why = format!("{} of {} build slots busy: {}", st.slots.running.len(), st.slots.cap, names.join(", "));
+                let why = format!("{} of {} build slots busy: {}", st.slots.running.len(), st.slots.cap, slot_holders(&st).join(", "));
                 bail!(coded("timeout", format!("{id} still queued for a build slot ({why}; {elapsed} elapsed); it keeps running: wait again")));
             }
             if let (St::Queued, Some(dev)) = (p.state, &p.device) {
@@ -2578,8 +2638,13 @@ async fn subscribe(d: &D, w: &mut OwnedWriteHalf) -> Result<Value> {
 }
 
 async fn acquire(d: &D, p: &Value, holder: &str) -> Result<Value> {
-    let device = match p["resource"].as_str().unwrap_or("port") {
+    let resource = p["resource"].as_str().unwrap_or("port");
+    if resource != "build" && ["pid", "priority", "name"].iter().any(|k| !p[k].is_null()) {
+        bail!(coded("bad_request", "--pid, --priority and --name apply to dibs on a build slot only"));
+    }
+    let device = match resource {
         "port" => None,
+        "build" => return Ok(json!(build_dib(d, p, holder).await?)),
         // A container is started for every service lease, so like a simulator it never queues.
         r @ ("postgres" | "redis") if p["preferred"].is_null() && p["wait"] != true => {
             let limit = Duration::from_millis(p["timeout_ms"].as_u64().unwrap_or(120_000));
@@ -2634,6 +2699,96 @@ async fn acquire(d: &D, p: &Value, holder: &str) -> Result<Value> {
     d.lock().leases.queue.retain(|w| w.id != wid);
     d.changed();
     bail!(coded("timeout", "dibs not granted before timeout"))
+}
+
+/// A build slot for process `pid`, which collie doesn't run (a CI job): a build dib, held until released or `pid`
+/// exits (`watch_builds`). With `wait`, queued for one (priority `ci`: ahead of every build without one), like a
+/// process (`Slot::take`); the dib takes the waiter's id. The dib `pid` already holds, if it has one.
+async fn build_dib(d: &D, p: &Value, holder: &str) -> Result<Lease> {
+    if ["preferred", "device", "runtime", "image"].iter().any(|k| !p[k].is_null()) {
+        bail!(coded("bad_request", "dibs on a build slot take --pid, --wait, --timeout, --priority and --name only"));
+    }
+    let pid = p["pid"].as_u64().ok_or_else(|| coded("bad_request", "dibs on a build slot need --pid <pid>, the process that holds it"))? as u32;
+    // pid 1's tree is the whole machine (cap pinned at 1, everything slowed); the daemon's own counts collie's twice.
+    if pid <= 1 || pid == std::process::id() {
+        bail!(coded("bad_request", format!("process {pid} can't hold a build slot; pass the job's own process")));
+    }
+    let priority = match p["priority"].as_str() {
+        None | Some("ci") => p["priority"].as_str().map(String::from),
+        Some(other) => bail!(coded("bad_request", format!("unknown priority {other}; the only one is ci"))),
+    };
+    let at = tokio::task::spawn_blocking(move || started(pid)).await?.ok_or_else(|| coded("not_found", format!("no process {pid}")))?;
+    let (wait, name, agent) = (p["wait"] == true, p["name"].as_str().map(String::from), agent_name(holder).await);
+    let id = {
+        let mut st = d.lock();
+        if let Some(l) = st.leases.leases.iter().find(|l| l.pid == Some(pid)) {
+            return Ok(l.clone());
+        }
+        let id = st.leases.reserve();
+        let w = Waiter { id, holder: holder.into(), agent, resource: "build".into(), device: None, pid: Some(pid), name, priority, preferred: None, since: now_ms(), process: None, tx: None };
+        st.slots.enqueue(format!("dibs:{id}"), w.priority.is_some());
+        st.leases.queue.push(w);
+        id
+    };
+    d.changed();
+    let key = format!("dibs:{id}");
+    let turn = async {
+        loop {
+            // Armed before looking, so a `changed` between the look and the await still wakes it.
+            let woken = d.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let got = {
+                let mut guard = d.lock();
+                let st = &mut *guard;
+                let busy = (!wait).then(|| {
+                    let ahead = st.slots.queued.iter().position(|q| *q == key).unwrap_or(0);
+                    let (n, cap, who) = (st.slots.running.len(), st.slots.cap, slot_holders(st).join(", "));
+                    format!("no build slot free for you now: {n} of {cap} busy ({who}), {ahead} queued ahead; pass --wait to queue")
+                });
+                let State { leases, slots, .. } = st;
+                let queued = leases.queue.iter().position(|w| w.id == id);
+                let got = match (leases.leases.iter().find(|l| l.pid == Some(pid)), queued) {
+                    (Some(l), _) => Some(Ok(l.clone())),
+                    // `watch_builds` saw the pid exit, or the holder's pane closed.
+                    (None, None) => Some(Err(coded("not_found", format!("process {pid} ended before it got a build slot")))),
+                    (None, Some(i)) if slots.may_start(&key) => {
+                        let w = leases.queue.remove(i);
+                        let now = now_ms();
+                        let l = Lease { id, holder: w.holder, agent: w.agent, resource: w.resource, pid: w.pid, pid_started: Some(at.clone()), name: w.name, priority: w.priority, acquired_at: now, expires_at: now + TTL_MS, ..Default::default() };
+                        leases.leases.push(l.clone());
+                        leases.save();
+                        slots.running.push(key.clone());
+                        Some(Ok(l))
+                    }
+                    (None, Some(_)) => busy.map(|b| Err(coded("busy", b))),
+                };
+                if got.is_some() {
+                    leases.queue.retain(|w| w.id != id);
+                    slots.leave(&key);
+                }
+                got
+            };
+            if let Some(got) = got {
+                d.changed();
+                return got;
+            }
+            woken.await;
+        }
+    };
+    if let Some(ms) = p["timeout_ms"].as_u64().filter(|_| wait) {
+        // Only `woken` awaits, and a pass that grants returns without awaiting, so a timeout never cuts a grant short.
+        if let Ok(got) = tokio::time::timeout(Duration::from_millis(ms), turn).await {
+            return got;
+        }
+        let mut st = d.lock();
+        st.leases.queue.retain(|w| w.id != id);
+        st.slots.leave(&key);
+        drop(st);
+        d.changed();
+        bail!(coded("timeout", "dibs not granted before timeout"));
+    }
+    turn.await
 }
 
 async fn call(d: &D, method: &str, p: &Value) -> Result<Value> {
@@ -2856,11 +3011,19 @@ async fn call(d: &D, method: &str, p: &Value) -> Result<Value> {
         "wait" => wait(d, &cwd, target, holder, p["until"].as_str().unwrap_or_default(), p["timeout_ms"].as_u64()).await,
         "lease.acquire" => acquire(d, p, holder).await,
         "lease.release" => {
-            let id = id()?;
-            let gone = drop_leases(d, |ls| ls.release(id, now_ms())).await;
-            if gone.is_empty() {
-                bail!(coded("not_found", format!("no dibs {id}")));
-            }
+            let gone = match p["pid"].as_u64() {
+                Some(pid) => {
+                    let gone = drop_leases(d, |ls| ls.remove(|l| l.pid == Some(pid as u32), now_ms())).await;
+                    ensure!(!gone.is_empty(), coded("not_found", format!("no build dibs held by process {pid}")));
+                    gone
+                }
+                None => {
+                    let id = id()?;
+                    let gone = drop_leases(d, |ls| ls.release(id, now_ms())).await;
+                    ensure!(!gone.is_empty(), coded("not_found", format!("no dibs {id}")));
+                    gone
+                }
+            };
             Ok(json!({"released": gone}))
         }
         "lease.renew" => {
@@ -2994,18 +3157,21 @@ async fn drain_retirements(d: &D) {
     }
 }
 
-/// Every `builds::EVERY_MS`: each live process's usage, and collie's total into the build-slot cap. While the cap is
-/// lowered for pressure, builds beyond the oldest run at background priority, so the oldest always runs at full speed.
+/// Every `builds::EVERY_MS`: each live process's usage, and the total with the build dibs' trees into the build-slot
+/// cap; build dibs whose pid exited are released. While the cap is lowered for pressure, every slot holder but one
+/// runs at background priority, so that one always runs at full speed.
 async fn watch_builds(d: D) {
     let path = builds::config_path();
-    let mut slowed = false;
+    // True at start, so the first sample takes every slot holder out of background priority: build dibs seated again
+    // after a restart may have been slowed by the previous daemon.
+    let mut slowed = true;
     loop {
         sleep(Duration::from_millis(builds::EVERY_MS)).await;
-        let (p, cores) = (path.clone(), d.lock().slots.cores);
+        let (p, cores, sampled) = (path.clone(), d.lock().slots.cores, now_ms());
         let Ok((rows, (knobs, err))) = tokio::task::spawn_blocking(move || (builds::sample(), builds::knobs(&p, cores))).await else { continue };
-        let (priorities, live) = {
+        let (priorities, live, ended) = {
             let mut st = d.lock();
-            let State { procs, slots, .. } = &mut *st;
+            let State { procs, slots, leases, .. } = &mut *st;
             let (mut total, mut trees) = (Usage::default(), HashMap::new());
             for p in procs.iter_mut() {
                 p.usage = p.pid.map(|pid| {
@@ -3016,18 +3182,43 @@ async fn watch_builds(d: D) {
                 });
                 (total.cpu, total.mem) = (total.cpu + p.usage.map_or(0.0, |u| u.cpu), total.mem + p.usage.map_or(0, |u| u.mem));
             }
+            // A build dib's pid is gone once it is missing from a sample taken after the dib was granted (or the
+            // waiter queued); a failed `ps` (no rows) says nothing.
+            let gone = |pid: Option<u32>, since: u64| since < sampled && !rows.is_empty() && pid.is_none_or(|pid| !rows.iter().any(|r| r.0 == pid));
+            let mut ended = vec![];
+            for l in leases.leases.iter().filter(|l| l.resource == "build") {
+                if gone(l.pid, l.acquired_at) {
+                    ended.push(l.id);
+                    continue;
+                }
+                let tree = l.pid.map_or(vec![], |pid| builds::tree(&rows, pid));
+                let u = builds::usage(&rows, &tree);
+                (total.cpu, total.mem) = (total.cpu + u.cpu, total.mem + u.mem);
+                trees.insert(format!("dibs:{}", l.id), tree);
+            }
+            // Its client may be gone too (a cancelled job), and it would block the queue's head for good.
+            let left: Vec<u64> = leases.queue.iter().filter(|w| w.resource == "build" && gone(w.pid, w.since)).map(|w| w.id).collect();
+            leases.queue.retain(|w| !left.contains(&w.id));
+            for id in &left {
+                slots.leave(&format!("dibs:{id}"));
+            }
             let before = (slots.cap, slots.slowed);
             slots.config_error = err;
             slots.step(knobs, total);
-            let live = !trees.is_empty() || before != (slots.cap, slots.slowed);
+            let live = !trees.is_empty() || !left.is_empty() || before != (slots.cap, slots.slowed);
             // Every sample while slowed: compilers start all the time, and the oldest changes as builds end.
+            let prioritised = |r: &String| leases.leases.iter().any(|l| l.priority.is_some() && *r == format!("dibs:{}", l.id));
+            let full = slots.running.iter().position(prioritised).unwrap_or(0);
             let priorities: Vec<(Vec<u32>, bool)> = match slots.slowed || slowed {
-                true => slots.running.iter().enumerate().filter_map(|(i, id)| Some((trees.remove(id)?, slots.slowed && i > 0))).collect(),
+                true => slots.running.iter().enumerate().filter_map(|(i, id)| Some((trees.remove(id)?, slots.slowed && i != full))).collect(),
                 false => vec![],
             };
             slowed = slots.slowed;
-            (priorities, live)
+            (priorities, live, ended)
         };
+        if !ended.is_empty() {
+            drop_leases(&d, |ls| ls.remove(|l| ended.contains(&l.id), now_ms())).await;
+        }
         for (pids, bg) in priorities {
             for pid in pids {
                 background(pid, bg);
@@ -3145,6 +3336,12 @@ async fn serve(dir: PathBuf, sock: PathBuf, _lock: File) -> Result<()> {
     let (knobs, config_error) = builds::knobs(&builds::config_path(), cores);
     let mut slots = Slots::new(knobs, cores, ram);
     slots.config_error = config_error;
+    // Waiters for a slot don't survive: their connection died with the old daemon, and a hook carries on without one.
+    let (leases, slots) = tokio::task::spawn_blocking(move || {
+        seat_build_dibs(&mut leases, &mut slots, started);
+        (leases, slots)
+    })
+    .await?;
     let d = Arc::new(Daemon {
         st: Mutex::new(State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0, slots }),
         tx: broadcast::channel(1024).0,
@@ -3425,6 +3622,40 @@ mod tests {
         assert!(ls.expire(TTL_MS - 1).is_empty());
         assert_eq!(ls.expire(TTL_MS).len(), 1);
         assert!(ls.leases.is_empty());
+    }
+
+    fn ci_dib(id: u64, pid: u32, started: &str, acquired_at: u64) -> Lease {
+        let at = Some(started.into());
+        Lease { id, holder: "ci".into(), resource: "build".into(), pid: Some(pid), pid_started: at, acquired_at, expires_at: acquired_at + TTL_MS, ..Default::default() }
+    }
+
+    #[test]
+    fn a_build_dib_outlives_the_ttl() {
+        let mut ls = Leases { leases: vec![ci_dib(1, 10, "A", 0)], ..Default::default() };
+        assert!(ls.expire(TTL_MS * 10).is_empty(), "its pid ends it, not the clock");
+    }
+
+    #[test]
+    fn a_released_port_never_goes_to_a_build_waiter() {
+        let mut ls = Leases::default();
+        let a = ls.acquire("w1:p1", None, None, false, None, 0).unwrap();
+        let w = Waiter { id: 99, holder: "ci".into(), agent: None, resource: "build".into(), device: None, pid: Some(10), name: None, priority: Some("ci".into()), preferred: None, since: 0, process: None, tx: None };
+        ls.queue.push(w);
+        ls.release(a.id, 0);
+        assert!(ls.leases.is_empty(), "{:?}", ls.leases);
+        assert_eq!(ls.queue.len(), 1, "it waits for a build slot still");
+    }
+
+    #[test]
+    fn restart_seats_build_dibs_whose_pid_still_runs_oldest_first() {
+        let mut ls = Leases { leases: vec![ci_dib(1, 10, "A", 5), ci_dib(2, 20, "B", 1), ci_dib(3, 30, "C", 0), ci_dib(4, 40, "D", 3)], ..Default::default() };
+        ls.acquire("w1:p1", None, None, false, None, 0).unwrap();
+        let mut slots = Slots::default();
+        // 10 and 40 still run; 20's pid now belongs to a later process, 30 is gone.
+        let now = |p: u32| [(10, "A"), (20, "B2"), (40, "D")].iter().find(|(q, _)| *q == p).map(|(_, s)| s.to_string());
+        seat_build_dibs(&mut ls, &mut slots, now);
+        assert_eq!(slots.running, ["dibs:4", "dibs:1"]);
+        assert_eq!(ls.leases.iter().map(|l| l.resource.as_str()).collect::<Vec<_>>(), ["build", "build", "port"], "other dibs stay");
     }
 
     #[test]
