@@ -2218,6 +2218,7 @@ impl App {
             let age = ago(now.saturating_sub(l["acquired_at"].as_u64().unwrap_or(now)));
             let sim = if l["device"].is_object() { &l["device"] } else { &l["simulator"] };
             let what = match (sim["name"].as_str(), l["service"].is_object()) {
+                _ if l["resource"] == "build" => format!("{} ", l["name"].as_str().unwrap_or("build slot")),
                 (Some(name), _) => format!("{name} "),
                 (None, true) => format!("{} :{} ", text(&l["resource"]), l["port"]),
                 (None, false) => format!(":{} ", l["port"]),
@@ -2232,6 +2233,7 @@ impl App {
         }
         for w in self.status["queue"].as_array().into_iter().flatten() {
             let want = match (w["device"]["name"].as_str(), w["preferred"].as_u64()) {
+                _ if w["resource"] == "build" => format!("a build slot{}", w["name"].as_str().map_or(String::new(), |n| format!(" ({n})"))),
                 (Some(name), _) => name.to_string(),
                 (None, Some(p)) => format!(":{p}"),
                 (None, None) => "any port".into(),
@@ -2283,7 +2285,11 @@ impl App {
                     Some(end) => format!("  took {}", ago(end.saturating_sub(since))).dim(),
                     None => format!("  up {}", ago(now_ms().saturating_sub(since))).dim(),
                 });
-                if p["state"] == "queued" {
+                if p["awaits_slot"] == true {
+                    let b = &self.status["builds"];
+                    let busy = b["running"].as_array().map_or(0, Vec::len);
+                    info.push(format!("  queued for a build slot ({busy} of {} busy)", b["cap"]).yellow());
+                } else if p["state"] == "queued" {
                     let udid = &p["device"]["udid"];
                     let lease = self.status["leases"].as_array().into_iter().flatten().find(|l| &l["device"]["udid"] == udid);
                     let behind = lease.map_or(String::new(), |l| format!(" behind {}", who(text(&l["holder"]), &l["agent"].as_str().map(Into::into))));

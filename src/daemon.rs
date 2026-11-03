@@ -1,3 +1,4 @@
+use crate::builds::{self, Slots, Usage};
 use crate::eco::{self, Ctx, Ecosystem, Level, Platform, Resource, Sim, SimKind, Source, Target};
 use crate::logs::{self, Filter, LogFile, Record};
 use anyhow::{Context, Result, bail, ensure};
@@ -88,7 +89,7 @@ pub fn port_open(port: u16) -> bool {
 
 // ---- leases
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Lease {
     pub id: u64,
     pub holder: String,
@@ -104,7 +105,19 @@ pub struct Lease {
     /// A throwaway database container (`postgres`, `redis`); `port` is its host port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<Service>,
+    /// A build dib's process, which collie doesn't run: its tree is measured, and its exit releases the dib.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// When `pid` started (`started`), so a restart doesn't seat a reused pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_started: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `ci`: queued for a build slot ahead of every build without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     pub acquired_at: u64,
+    /// Not enforced for a build dib, which lasts as long as its `pid`.
     pub expires_at: u64,
     /// Held by a process `run` started; dropped when the daemon starts, since processes don't outlive it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -132,6 +145,13 @@ pub struct Waiter {
     pub resource: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<Sim>,
+    /// A build dib's, as on `Lease`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
     pub preferred: Option<u16>,
     pub since: u64,
     /// The process queued for the device (`run`'s `queue`); none for `dibs acquire --wait`.
@@ -248,7 +268,7 @@ impl Leases {
         if let Some(s) = &simulator {
             self.devices.push(s.key());
         }
-        let l = Lease { id, holder: holder.into(), agent, resource, port, simulator, device, service: None, acquired_at: now, expires_at: now + TTL_MS, run, process: None };
+        let l = Lease { id, holder: holder.into(), agent, resource, port, simulator, device, acquired_at: now, expires_at: now + TTL_MS, run, ..Default::default() };
         self.leases.push(l.clone());
         self.save();
         l
@@ -274,13 +294,18 @@ impl Leases {
         let id = self.next;
         self.next += 1;
         let resource = if device.is_some() { "device" } else { "port" }.into();
-        self.queue.push(Waiter { id, holder: holder.into(), agent, resource, device, preferred, since: now, process, tx: Some(tx) });
+        self.queue.push(Waiter { id, holder: holder.into(), agent, resource, device, pid: None, name: None, priority: None, preferred, since: now, process, tx: Some(tx) });
         (id, rx)
     }
 
     fn hand_to_waiters(&mut self, now: u64) {
         let mut i = 0;
         while i < self.queue.len() {
+            // A build slot is `Slots`' to give (`build_dib`), never a port.
+            if self.queue[i].resource == "build" {
+                i += 1;
+                continue;
+            }
             let fits = match &self.queue[i].device {
                 Some(dev) => self.device_lease(&dev.udid).is_none().then_some(None),
                 None => self.pick(self.queue[i].preferred, true).map(Some),
@@ -329,8 +354,9 @@ impl Leases {
         self.remove(|l| l.id == id, now)
     }
 
+    /// Drops leases past their TTL; a build dib ends with its pid instead (`watch_builds`).
     pub fn expire(&mut self, now: u64) -> Vec<Lease> {
-        self.remove(|l| l.expires_at <= now, now)
+        self.remove(|l| l.pid.is_none() && l.expires_at <= now, now)
     }
 
     pub fn release_holder(&mut self, holder: &str, now: u64) -> Vec<Lease> {
@@ -353,7 +379,8 @@ impl Leases {
 #[serde(rename_all = "lowercase")]
 enum St {
     Building,
-    /// Waiting for a physical device another holder has, before its run phase; built already if it has a build.
+    /// Waiting for a physical device another holder has, before its run phase (built already if it has a build), or
+    /// for a build slot (`awaits_slot`).
     Queued,
     Running,
     Exited,
@@ -398,6 +425,10 @@ struct Proc {
     /// Its build problems' counts, `{"error", "warning", "lint"}` (the items are in `<id>.problems.json`); null for
     /// exec and a run stopped before it ended.
     problems: Option<Value>,
+    /// CPU and memory of its process and all its descendants at the last sample; null while no process runs.
+    usage: Option<Usage>,
+    /// Queued for a build slot (`builds`), not for a device.
+    awaits_slot: bool,
     /// Its run phase outlived its kill limit and is being killed; `finish` makes it `timed-out`. Not the state
     /// itself before then, which would count as ended while the process still lives.
     #[serde(skip)]
@@ -422,6 +453,7 @@ struct State {
     writing: HashSet<String>,
     /// When `prune` last started, Unix ms.
     pruned_at: u64,
+    slots: Slots,
 }
 
 struct Daemon {
@@ -432,6 +464,8 @@ struct Daemon {
     logs: PathBuf,
     /// `build_time()` at start.
     built: u64,
+    /// Woken on every `changed`, so a process queued for a build slot looks again.
+    wake: tokio::sync::Notify,
 }
 
 type D = Arc<Daemon>;
@@ -443,11 +477,12 @@ impl Daemon {
 
     fn snapshot(&self) -> Value {
         let st = self.lock();
-        json!({"processes": st.procs, "leases": st.leases.leases, "queue": st.leases.queue})
+        json!({"processes": st.procs, "leases": st.leases.leases, "queue": st.leases.queue, "builds": st.slots})
     }
 
     fn changed(&self) {
         let _ = self.tx.send(json!({"event": "status", "data": self.snapshot()}));
+        self.wake.notify_waiters();
     }
 
     fn log_path(&self, id: &str) -> PathBuf {
@@ -593,6 +628,17 @@ fn survivors(groups: &[(u32, String)], started: impl Fn(u32) -> Option<String>) 
     groups.iter().filter(|(g, at)| started(*g).as_ref() == Some(at)).map(|(g, _)| *g).collect()
 }
 
+/// At start: build dibs whose pid still runs as the process recorded take their slots back, oldest first (possibly
+/// past the cap, which then holds the queue until they end); the rest ended while the daemon was down and go.
+fn seat_build_dibs(leases: &mut Leases, slots: &mut Slots, started: impl Fn(u32) -> Option<String>) {
+    let held: Vec<(u32, String)> = leases.leases.iter().filter_map(|l| Some((l.pid?, l.pid_started.clone()?))).collect();
+    let live = survivors(&held, started);
+    leases.remove(|l| l.resource == "build" && !l.pid.is_some_and(|p| live.contains(&p)), now_ms());
+    let mut seated: Vec<&Lease> = leases.leases.iter().filter(|l| l.resource == "build").collect();
+    seated.sort_by_key(|l| l.acquired_at);
+    slots.running = seated.iter().map(|l| format!("dibs:{}", l.id)).collect();
+}
+
 /// Removes matching processes, records the live ones in the history, releases their leases and kills their process
 /// groups.
 async fn stop_where(d: &D, pred: impl Fn(&Proc) -> bool) -> Vec<String> {
@@ -624,9 +670,24 @@ async fn stop_where(d: &D, pred: impl Fn(&Proc) -> bool) -> Vec<String> {
     gone.into_iter().map(|p| p.id).collect()
 }
 
-/// Drops leases (released, expired, holder gone) and stops the processes that held them.
+/// Drops leases (released, expired, holder gone, a build dib's pid gone), frees the build slots of build dibs among
+/// them, and stops the processes that held them.
 async fn drop_leases(d: &D, f: impl FnOnce(&mut Leases) -> Vec<Lease>) -> Vec<Lease> {
-    let gone = f(&mut d.lock().leases);
+    let gone = {
+        let mut st = d.lock();
+        let gone = f(&mut st.leases);
+        st.slots.running.retain(|r| !gone.iter().any(|l| *r == format!("dibs:{}", l.id)));
+        gone
+    };
+    // Out of background priority: with its slot gone, no later sample would reset a job that runs on.
+    let pids: Vec<u32> = gone.iter().filter_map(|l| l.pid).collect();
+    if !pids.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || {
+            let rows = builds::sample();
+            pids.iter().flat_map(|&pid| builds::tree(&rows, pid)).for_each(|p| background(p, false));
+        })
+        .await;
+    }
     if !gone.is_empty() {
         let ids: Vec<u64> = gone.iter().map(|l| l.id).collect();
         stop_where(d, |p| p.leases.iter().any(|id| ids.contains(id))).await;
@@ -817,7 +878,59 @@ async fn prepare(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, dir: 
     Ok(())
 }
 
-/// Runs one phase; None if it could not spawn or the process was stopped meanwhile.
+/// A build slot process `.1` holds; given back on drop, so every way a phase ends frees it.
+struct Slot(D, String);
+
+impl Slot {
+    /// Queues `id` for a slot and waits its turn (state `queued`, `awaits_slot`); None when it was stopped meanwhile.
+    async fn take(d: &D, id: &str) -> Option<Slot> {
+        d.lock().slots.queued.push(id.into());
+        loop {
+            // Armed before looking, so a `changed` between the look and the await still wakes it.
+            let woken = d.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let (got, flipped) = {
+                let mut st = d.lock();
+                let State { procs, slots, .. } = &mut *st;
+                match procs.iter_mut().find(|p| p.id == id) {
+                    None => {
+                        slots.queued.retain(|q| q != id);
+                        (Some(None), true)
+                    }
+                    Some(p) if slots.may_start(id) => {
+                        slots.running.push(slots.queued.remove(0));
+                        p.awaits_slot = false;
+                        (Some(Some(Slot(d.clone(), id.into()))), true)
+                    }
+                    Some(p) if !p.awaits_slot => {
+                        // The last phase's group is gone: a stop while queued mustn't kill whatever reuses its pid.
+                        (p.state, p.pid, p.awaits_slot) = (St::Queued, None, true);
+                        (None, true)
+                    }
+                    Some(_) => (None, false),
+                }
+            };
+            if flipped {
+                d.changed();
+            }
+            if let Some(got) = got {
+                return got;
+            }
+            woken.await;
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.lock().slots.running.retain(|r| r != &self.1);
+        self.0.changed();
+    }
+}
+
+/// Runs one phase; None if it could not spawn or the process was stopped meanwhile. A build phase, and every phase of an
+/// exec or test run, first waits for a build slot.
 async fn exec(
     d: &D,
     id: &str,
@@ -839,6 +952,12 @@ async fn exec(
         cmd.env("PORT", p.to_string());
     }
     let (out, err) = if phase == St::Building { (Source::Build, Source::Build) } else { (Source::Stdout, Source::Stderr) };
+    let kind = d.lock().procs.iter().find(|p| p.id == id).map(|p| p.kind.clone());
+    // An app's or server's run phase holds none: it may run for hours, and its CPU isn't a build's.
+    let _slot = match phase == St::Building || matches!(kind.as_deref(), Some("exec" | "test")) {
+        true => Some(Slot::take(d, id).await?),
+        false => None,
+    };
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(x) => {
@@ -2260,6 +2379,8 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
                     only: !only.is_empty(),
                     branch: branch.clone(),
                     problems: None,
+                    usage: None,
+                    awaits_slot: false,
                     timed_out: false,
                     t: t.clone(),
                 })
@@ -2343,6 +2464,16 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
     Ok(v)
 }
 
+/// Who holds each build slot: a process's target, or a build dib's name (else its holder).
+fn slot_holders(st: &State) -> Vec<String> {
+    let dib = |id: &str| st.leases.leases.iter().find(|l| l.id.to_string() == id).map(|l| l.name.clone().unwrap_or_else(|| l.holder.clone()));
+    let named = |r: &String| match r.strip_prefix("dibs:") {
+        Some(id) => dib(id),
+        None => st.procs.iter().find(|p| &p.id == r).map(|p| p.target.clone()),
+    };
+    st.slots.running.iter().filter_map(named).collect()
+}
+
 async fn wait(d: &D, cwd: &Path, target: Option<&str>, holder: &str, until: &str, timeout: Option<u64>) -> Result<Value> {
     let id = newest(d, cwd, target, holder)?;
     let deadline = timeout.map(|ms| Instant::now() + Duration::from_millis(ms));
@@ -2374,6 +2505,11 @@ async fn wait(d: &D, cwd: &Path, target: Option<&str>, holder: &str, until: &str
             let last = last.map_or("—".to_string(), |r| r.line.lines().next().unwrap_or_default().chars().take(160).collect());
             let state = json!(p.state);
             let elapsed = crate::tui::ago(now_ms().saturating_sub(p.since));
+            if p.awaits_slot {
+                let st = d.lock();
+                let why = format!("{} of {} build slots busy: {}", st.slots.running.len(), st.slots.cap, slot_holders(&st).join(", "));
+                bail!(coded("timeout", format!("{id} still queued for a build slot ({why}; {elapsed} elapsed); it keeps running: wait again")));
+            }
             if let (St::Queued, Some(dev)) = (p.state, &p.device) {
                 let behind = d.lock().leases.device_lease(&dev.udid).map_or("—".to_string(), |l| who(&l.holder, &l.agent));
                 bail!(coded("timeout", format!("{id} still queued for {} behind {behind} ({elapsed} elapsed); it keeps running: wait again", dev.name)));
@@ -2502,8 +2638,13 @@ async fn subscribe(d: &D, w: &mut OwnedWriteHalf) -> Result<Value> {
 }
 
 async fn acquire(d: &D, p: &Value, holder: &str) -> Result<Value> {
-    let device = match p["resource"].as_str().unwrap_or("port") {
+    let resource = p["resource"].as_str().unwrap_or("port");
+    if resource != "build" && ["pid", "priority", "name"].iter().any(|k| !p[k].is_null()) {
+        bail!(coded("bad_request", "--pid, --priority and --name apply to dibs on a build slot only"));
+    }
+    let device = match resource {
         "port" => None,
+        "build" => return Ok(json!(build_dib(d, p, holder).await?)),
         // A container is started for every service lease, so like a simulator it never queues.
         r @ ("postgres" | "redis") if p["preferred"].is_null() && p["wait"] != true => {
             let limit = Duration::from_millis(p["timeout_ms"].as_u64().unwrap_or(120_000));
@@ -2558,6 +2699,96 @@ async fn acquire(d: &D, p: &Value, holder: &str) -> Result<Value> {
     d.lock().leases.queue.retain(|w| w.id != wid);
     d.changed();
     bail!(coded("timeout", "dibs not granted before timeout"))
+}
+
+/// A build slot for process `pid`, which collie doesn't run (a CI job): a build dib, held until released or `pid`
+/// exits (`watch_builds`). With `wait`, queued for one (priority `ci`: ahead of every build without one), like a
+/// process (`Slot::take`); the dib takes the waiter's id. The dib `pid` already holds, if it has one.
+async fn build_dib(d: &D, p: &Value, holder: &str) -> Result<Lease> {
+    if ["preferred", "device", "runtime", "image"].iter().any(|k| !p[k].is_null()) {
+        bail!(coded("bad_request", "dibs on a build slot take --pid, --wait, --timeout, --priority and --name only"));
+    }
+    let pid = p["pid"].as_u64().ok_or_else(|| coded("bad_request", "dibs on a build slot need --pid <pid>, the process that holds it"))? as u32;
+    // pid 1's tree is the whole machine (cap pinned at 1, everything slowed); the daemon's own counts collie's twice.
+    if pid <= 1 || pid == std::process::id() {
+        bail!(coded("bad_request", format!("process {pid} can't hold a build slot; pass the job's own process")));
+    }
+    let priority = match p["priority"].as_str() {
+        None | Some("ci") => p["priority"].as_str().map(String::from),
+        Some(other) => bail!(coded("bad_request", format!("unknown priority {other}; the only one is ci"))),
+    };
+    let at = tokio::task::spawn_blocking(move || started(pid)).await?.ok_or_else(|| coded("not_found", format!("no process {pid}")))?;
+    let (wait, name, agent) = (p["wait"] == true, p["name"].as_str().map(String::from), agent_name(holder).await);
+    let id = {
+        let mut st = d.lock();
+        if let Some(l) = st.leases.leases.iter().find(|l| l.pid == Some(pid)) {
+            return Ok(l.clone());
+        }
+        let id = st.leases.reserve();
+        let w = Waiter { id, holder: holder.into(), agent, resource: "build".into(), device: None, pid: Some(pid), name, priority, preferred: None, since: now_ms(), process: None, tx: None };
+        st.slots.enqueue(format!("dibs:{id}"), w.priority.is_some());
+        st.leases.queue.push(w);
+        id
+    };
+    d.changed();
+    let key = format!("dibs:{id}");
+    let turn = async {
+        loop {
+            // Armed before looking, so a `changed` between the look and the await still wakes it.
+            let woken = d.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let got = {
+                let mut guard = d.lock();
+                let st = &mut *guard;
+                let busy = (!wait).then(|| {
+                    let ahead = st.slots.queued.iter().position(|q| *q == key).unwrap_or(0);
+                    let (n, cap, who) = (st.slots.running.len(), st.slots.cap, slot_holders(st).join(", "));
+                    format!("no build slot free for you now: {n} of {cap} busy ({who}), {ahead} queued ahead; pass --wait to queue")
+                });
+                let State { leases, slots, .. } = st;
+                let queued = leases.queue.iter().position(|w| w.id == id);
+                let got = match (leases.leases.iter().find(|l| l.pid == Some(pid)), queued) {
+                    (Some(l), _) => Some(Ok(l.clone())),
+                    // `watch_builds` saw the pid exit, or the holder's pane closed.
+                    (None, None) => Some(Err(coded("not_found", format!("process {pid} ended before it got a build slot")))),
+                    (None, Some(i)) if slots.may_start(&key) => {
+                        let w = leases.queue.remove(i);
+                        let now = now_ms();
+                        let l = Lease { id, holder: w.holder, agent: w.agent, resource: w.resource, pid: w.pid, pid_started: Some(at.clone()), name: w.name, priority: w.priority, acquired_at: now, expires_at: now + TTL_MS, ..Default::default() };
+                        leases.leases.push(l.clone());
+                        leases.save();
+                        slots.running.push(key.clone());
+                        Some(Ok(l))
+                    }
+                    (None, Some(_)) => busy.map(|b| Err(coded("busy", b))),
+                };
+                if got.is_some() {
+                    leases.queue.retain(|w| w.id != id);
+                    slots.leave(&key);
+                }
+                got
+            };
+            if let Some(got) = got {
+                d.changed();
+                return got;
+            }
+            woken.await;
+        }
+    };
+    if let Some(ms) = p["timeout_ms"].as_u64().filter(|_| wait) {
+        // Only `woken` awaits, and a pass that grants returns without awaiting, so a timeout never cuts a grant short.
+        if let Ok(got) = tokio::time::timeout(Duration::from_millis(ms), turn).await {
+            return got;
+        }
+        let mut st = d.lock();
+        st.leases.queue.retain(|w| w.id != id);
+        st.slots.leave(&key);
+        drop(st);
+        d.changed();
+        bail!(coded("timeout", "dibs not granted before timeout"));
+    }
+    turn.await
 }
 
 async fn call(d: &D, method: &str, p: &Value) -> Result<Value> {
@@ -2780,11 +3011,19 @@ async fn call(d: &D, method: &str, p: &Value) -> Result<Value> {
         "wait" => wait(d, &cwd, target, holder, p["until"].as_str().unwrap_or_default(), p["timeout_ms"].as_u64()).await,
         "lease.acquire" => acquire(d, p, holder).await,
         "lease.release" => {
-            let id = id()?;
-            let gone = drop_leases(d, |ls| ls.release(id, now_ms())).await;
-            if gone.is_empty() {
-                bail!(coded("not_found", format!("no dibs {id}")));
-            }
+            let gone = match p["pid"].as_u64() {
+                Some(pid) => {
+                    let gone = drop_leases(d, |ls| ls.remove(|l| l.pid == Some(pid as u32), now_ms())).await;
+                    ensure!(!gone.is_empty(), coded("not_found", format!("no build dibs held by process {pid}")));
+                    gone
+                }
+                None => {
+                    let id = id()?;
+                    let gone = drop_leases(d, |ls| ls.release(id, now_ms())).await;
+                    ensure!(!gone.is_empty(), coded("not_found", format!("no dibs {id}")));
+                    gone
+                }
+            };
             Ok(json!({"released": gone}))
         }
         "lease.renew" => {
@@ -2918,6 +3157,79 @@ async fn drain_retirements(d: &D) {
     }
 }
 
+/// Every `builds::EVERY_MS`: each live process's usage, and the total with the build dibs' trees into the build-slot
+/// cap; build dibs whose pid exited are released. While the cap is lowered for pressure, every slot holder but one
+/// runs at background priority, so that one always runs at full speed.
+async fn watch_builds(d: D) {
+    let path = builds::config_path();
+    // True at start, so the first sample takes every slot holder out of background priority: build dibs seated again
+    // after a restart may have been slowed by the previous daemon.
+    let mut slowed = true;
+    loop {
+        sleep(Duration::from_millis(builds::EVERY_MS)).await;
+        let (p, cores, sampled) = (path.clone(), d.lock().slots.cores, now_ms());
+        let Ok((rows, (knobs, err))) = tokio::task::spawn_blocking(move || (builds::sample(), builds::knobs(&p, cores))).await else { continue };
+        let (priorities, live, ended) = {
+            let mut st = d.lock();
+            let State { procs, slots, leases, .. } = &mut *st;
+            let (mut total, mut trees) = (Usage::default(), HashMap::new());
+            for p in procs.iter_mut() {
+                p.usage = p.pid.map(|pid| {
+                    let tree = builds::tree(&rows, pid);
+                    let u = builds::usage(&rows, &tree);
+                    trees.insert(p.id.clone(), tree);
+                    u
+                });
+                (total.cpu, total.mem) = (total.cpu + p.usage.map_or(0.0, |u| u.cpu), total.mem + p.usage.map_or(0, |u| u.mem));
+            }
+            // A build dib's pid is gone once it is missing from a sample taken after the dib was granted (or the
+            // waiter queued); a failed `ps` (no rows) says nothing.
+            let gone = |pid: Option<u32>, since: u64| since < sampled && !rows.is_empty() && pid.is_none_or(|pid| !rows.iter().any(|r| r.0 == pid));
+            let mut ended = vec![];
+            for l in leases.leases.iter().filter(|l| l.resource == "build") {
+                if gone(l.pid, l.acquired_at) {
+                    ended.push(l.id);
+                    continue;
+                }
+                let tree = l.pid.map_or(vec![], |pid| builds::tree(&rows, pid));
+                let u = builds::usage(&rows, &tree);
+                (total.cpu, total.mem) = (total.cpu + u.cpu, total.mem + u.mem);
+                trees.insert(format!("dibs:{}", l.id), tree);
+            }
+            // Its client may be gone too (a cancelled job), and it would block the queue's head for good.
+            let left: Vec<u64> = leases.queue.iter().filter(|w| w.resource == "build" && gone(w.pid, w.since)).map(|w| w.id).collect();
+            leases.queue.retain(|w| !left.contains(&w.id));
+            for id in &left {
+                slots.leave(&format!("dibs:{id}"));
+            }
+            let before = (slots.cap, slots.slowed);
+            slots.config_error = err;
+            slots.step(knobs, total);
+            let live = !trees.is_empty() || !left.is_empty() || before != (slots.cap, slots.slowed);
+            // Every sample while slowed: compilers start all the time, and the oldest changes as builds end.
+            let prioritised = |r: &String| leases.leases.iter().any(|l| l.priority.is_some() && *r == format!("dibs:{}", l.id));
+            let full = slots.running.iter().position(prioritised).unwrap_or(0);
+            let priorities: Vec<(Vec<u32>, bool)> = match slots.slowed || slowed {
+                true => slots.running.iter().enumerate().filter_map(|(i, id)| Some((trees.remove(id)?, slots.slowed && i != full))).collect(),
+                false => vec![],
+            };
+            slowed = slots.slowed;
+            (priorities, live, ended)
+        };
+        if !ended.is_empty() {
+            drop_leases(&d, |ls| ls.remove(|l| ended.contains(&l.id), now_ms())).await;
+        }
+        for (pids, bg) in priorities {
+            for pid in pids {
+                background(pid, bg);
+            }
+        }
+        if live {
+            d.changed();
+        }
+    }
+}
+
 async fn expire_leases(d: D) {
     loop {
         sleep(Duration::from_secs(1)).await;
@@ -2930,7 +3242,21 @@ async fn expire_leases(d: D) {
 // From libc, which std has no stable wrapper for (`CommandExt::setsid` is unstable).
 unsafe extern "C" {
     fn setsid() -> i32;
+    #[cfg(target_os = "macos")]
+    fn setpriority(which: i32, who: u32, prio: i32) -> i32;
 }
+
+/// Moves `pid` to macOS background priority (slower CPU and I/O, yielding to everything else), or back out of it.
+#[cfg(target_os = "macos")]
+fn background(pid: u32, on: bool) {
+    // <sys/resource.h>: PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG. Unlike a raised nice, an unprivileged user can undo it.
+    // SAFETY: a plain syscall on a pid; a gone or foreign pid only fails it.
+    unsafe { setpriority(4, pid, if on { 0x1000 } else { 0 }) };
+}
+
+// ponytail: no slowdown on Linux, where an unprivileged user can raise a nice value but never lower it back.
+#[cfg(not(target_os = "macos"))]
+fn background(_: u32, _: bool) {}
 
 /// Blocks until no daemon holds `daemon.lock`, up to 20 s: a stopped daemon answers first, then drains (simulators,
 /// containers) before it exits, and a command starting one meanwhile would lose the lock to it and fail.
@@ -3006,14 +3332,26 @@ async fn serve(dir: PathBuf, sock: PathBuf, _lock: File) -> Result<()> {
     if old_logs != logs_dir() && old_logs.is_dir() {
         let _ = std::fs::remove_dir_all(&old_logs);
     }
+    let (cores, ram) = builds::machine();
+    let (knobs, config_error) = builds::knobs(&builds::config_path(), cores);
+    let mut slots = Slots::new(knobs, cores, ram);
+    slots.config_error = config_error;
+    // Waiters for a slot don't survive: their connection died with the old daemon, and a hook carries on without one.
+    let (leases, slots) = tokio::task::spawn_blocking(move || {
+        seat_build_dibs(&mut leases, &mut slots, started);
+        (leases, slots)
+    })
+    .await?;
     let d = Arc::new(Daemon {
-        st: Mutex::new(State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0 }),
+        st: Mutex::new(State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0, slots }),
         tx: broadcast::channel(1024).0,
         dir,
         logs: logs_dir(),
         built: build_time(),
+        wake: Default::default(),
     });
     prune_soon(&d);
+    tokio::spawn(watch_builds(d.clone()));
     tokio::spawn(retire_sims(d.clone(), rx));
     tokio::spawn(remove_containers(d.clone(), containers));
     // Containers of this daemon's label that no surviving lease holds; free-standing dibs survive a restart, and so do
@@ -3109,7 +3447,7 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_runs_results_drop_no_tests() {
         let logs = scratch();
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: Leases::default(), stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: Leases::default(), stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0, wake: Default::default() });
         let mut log = LogFile::open(&logs.join("stopped.log")).unwrap();
         log.append(&Record { ts: 0, source: Source::Stdout, level: Level::Info, line: "test tests::a ... ok".into() });
         let t = Target { name: "cargo test".into(), ecosystem: "cargo".into(), dir: "/w".into(), kind: "test".into(), package: None, needs_port: false, port: None, target_dir: None };
@@ -3239,7 +3577,7 @@ mod tests {
         assert_eq!(build_problems(&recs, &root, &root, false).len(), 3, "a task without a build: all its output");
         // Stopped: the process is gone by the time its problems would be saved.
         let logs = scratch();
-        let d: D = Arc::new(Daemon { st: Mutex::new(state(Leases::default())), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(state(Leases::default())), tx: broadcast::channel(1).0, dir: scratch(), logs: logs.clone(), built: 0, wake: Default::default() });
         let t = Target { name: "app".into(), ecosystem: "xcode".into(), dir: root.clone(), kind: "app".into(), package: None, needs_port: false, port: None, target_dir: None };
         save_problems(&d, "gone", &t, true).await;
         assert!(!logs.join("gone.problems.json").exists());
@@ -3284,6 +3622,40 @@ mod tests {
         assert!(ls.expire(TTL_MS - 1).is_empty());
         assert_eq!(ls.expire(TTL_MS).len(), 1);
         assert!(ls.leases.is_empty());
+    }
+
+    fn ci_dib(id: u64, pid: u32, started: &str, acquired_at: u64) -> Lease {
+        let at = Some(started.into());
+        Lease { id, holder: "ci".into(), resource: "build".into(), pid: Some(pid), pid_started: at, acquired_at, expires_at: acquired_at + TTL_MS, ..Default::default() }
+    }
+
+    #[test]
+    fn a_build_dib_outlives_the_ttl() {
+        let mut ls = Leases { leases: vec![ci_dib(1, 10, "A", 0)], ..Default::default() };
+        assert!(ls.expire(TTL_MS * 10).is_empty(), "its pid ends it, not the clock");
+    }
+
+    #[test]
+    fn a_released_port_never_goes_to_a_build_waiter() {
+        let mut ls = Leases::default();
+        let a = ls.acquire("w1:p1", None, None, false, None, 0).unwrap();
+        let w = Waiter { id: 99, holder: "ci".into(), agent: None, resource: "build".into(), device: None, pid: Some(10), name: None, priority: Some("ci".into()), preferred: None, since: 0, process: None, tx: None };
+        ls.queue.push(w);
+        ls.release(a.id, 0);
+        assert!(ls.leases.is_empty(), "{:?}", ls.leases);
+        assert_eq!(ls.queue.len(), 1, "it waits for a build slot still");
+    }
+
+    #[test]
+    fn restart_seats_build_dibs_whose_pid_still_runs_oldest_first() {
+        let mut ls = Leases { leases: vec![ci_dib(1, 10, "A", 5), ci_dib(2, 20, "B", 1), ci_dib(3, 30, "C", 0), ci_dib(4, 40, "D", 3)], ..Default::default() };
+        ls.acquire("w1:p1", None, None, false, None, 0).unwrap();
+        let mut slots = Slots::default();
+        // 10 and 40 still run; 20's pid now belongs to a later process, 30 is gone.
+        let now = |p: u32| [(10, "A"), (20, "B2"), (40, "D")].iter().find(|(q, _)| *q == p).map(|(_, s)| s.to_string());
+        seat_build_dibs(&mut ls, &mut slots, now);
+        assert_eq!(slots.running, ["dibs:4", "dibs:1"]);
+        assert_eq!(ls.leases.iter().map(|l| l.resource.as_str()).collect::<Vec<_>>(), ["build", "build", "port"], "other dibs stay");
     }
 
     #[test]
@@ -3416,7 +3788,7 @@ mod tests {
         assert_eq!((&v["resource"], &v["simulator"]["name"], v.get("port")), (&json!("simulator"), &json!(format!("collie {id}")), None));
 
         let p = my_app("APP-1", vec![port.id, s.id], &s, true);
-        let mut st = State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let mine = |h: &'static str| move |p: &Proc| p.target == "MyApp" && p.holder == h;
         assert!(carry(&mut st, mine("w1:p2"), sim_fits(&kind("iPhone 18 Pro"), &None)).is_none(), "another holder gets a fresh device");
         assert!(carry(&mut st, mine("w1:p1"), sim_fits(&kind("iPhone 17 Pro"), &None)).is_none(), "a changed kind gets a fresh device");
@@ -3445,7 +3817,7 @@ mod tests {
         let mut building = my_app("APP-1", vec![failed.id], &failed, false);
         building.state = St::Building;
         let running = my_app("APP-2", vec![exited.id], &exited, true);
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building, running], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building, running], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         use std::os::unix::process::ExitStatusExt;
         finish(&d, "APP-1", Some(ExitStatus::from_raw(1 << 8)));
         finish(&d, "APP-2", Some(ExitStatus::from_raw(0)));
@@ -3473,7 +3845,7 @@ mod tests {
         };
         let procs = vec![test("F-1", "ListCoreTests", &running, St::Running), test("D-1", "SyncCoreTests", &ended, St::Exited)];
         let t = procs[0].t.clone();
-        let mut st = State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let k = kind("iPhone 18 Pro");
         let fits = || sim_fits(&k, &None);
         let search = Target { name: "SearchCoreTests".into(), ..t.clone() };
@@ -3510,7 +3882,7 @@ mod tests {
             p
         };
         let procs = vec![test("T-1", &failed, false), test("T-2", &hung, true)];
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         use std::os::unix::process::ExitStatusExt;
         finish(&d, "T-1", Some(ExitStatus::from_raw(65 << 8)));
         finish(&d, "T-2", Some(ExitStatus::from_raw(15)));
@@ -3607,7 +3979,7 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/template-fail");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(16).0, dir: dir.clone(), logs: dir.join("logs"), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(16).0, dir: dir.clone(), logs: dir.join("logs"), built: 0, wake: Default::default() });
         let e = save_template(&d, &t, "w1:p1", &HashMap::new()).await.unwrap_err().to_string();
         assert!(e.contains(&format!("kept as dibs {id}")), "{e}");
         let st = d.lock();
@@ -3623,7 +3995,7 @@ mod tests {
     }
 
     fn state(leases: Leases) -> State {
-        State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0 }
+        State { procs: vec![], leases, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }
     }
 
     #[test]
@@ -3670,7 +4042,7 @@ mod tests {
         // Released during a-1's build: handed to it, though it doesn't take it (`adopt`) until its run phase.
         st.leases.release(held.id, 0);
         assert_eq!(st.leases.device_lease(&phone().udid).and_then(|l| l.process.clone()).as_deref(), Some("a-1"));
-        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         finish(&d, "a-1", None); // its build failed
         assert_eq!(d.lock().leases.device_lease(&phone().udid).and_then(|l| l.process.clone()).as_deref(), Some("b-1"), "back, to the next in line");
         stop_where(&d, |p| p.id == "b-1").await; // stopped mid-build
@@ -3694,7 +4066,7 @@ mod tests {
             p.state = St::Queued;
             st.procs.push(p);
         }
-        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(st), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         finish(&d, "a-1", None); // its build failed
         stop_where(&d, |p| p.id == "b-1").await;
         assert!(d.lock().leases.queue.is_empty());
@@ -3772,7 +4144,7 @@ mod tests {
         let mut ls = Leases::default();
         let id = ls.reserve();
         let l = ls.grant(id, "w1:p1", None, None, None, Some(phone()), true, 0);
-        let mut st = State { procs: vec![my_app("APP-1", vec![l.id], &l, true)], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs: vec![my_app("APP-1", vec![l.id], &l, true)], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let same = |p: &Proc| p.target == "MyApp";
         let code = |r: Result<Lease>| r.unwrap_err().downcast_ref::<Coded>().unwrap().0.clone();
         assert_eq!(code(lease_device(&mut st, same, "w1:p2", None, false, &phone(), "MyApp")), "busy");
@@ -3794,7 +4166,7 @@ mod tests {
         let mut ls = Leases::default();
         let held = ls.acquire("w1:p1", None, None, false, Some(phone()), 0).unwrap();
         assert!(!held.run);
-        let mut st = State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 };
+        let mut st = State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() };
         let same = |p: &Proc| p.target == "MyApp";
         let code = |r: Result<Lease>| r.unwrap_err().downcast_ref::<Coded>().unwrap().0.clone();
         assert_eq!(code(lease_device(&mut st, same, "w1:p2", None, true, &phone(), "MyApp")), "busy", "take doesn't take a free-standing lease");
@@ -3831,7 +4203,7 @@ mod tests {
         let (_, mut rx) = ls.enqueue("w1:p2", None, None, Some(phone()), None, 0);
         let mut building = my_app("APP-1", vec![l.id], &l, false);
         building.state = St::Building;
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![building], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(1).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         use std::os::unix::process::ExitStatusExt;
         finish(&d, "APP-1", Some(ExitStatus::from_raw(1 << 8)));
         assert_eq!(rx.try_recv().unwrap().holder, "w1:p2", "unlike a simulator, it doesn't stay with the ended process");
@@ -3845,7 +4217,7 @@ mod tests {
         let mut port_only = my_app("NODE-1", vec![], &l, false);
         port_only.device = None;
         let procs = vec![my_app("APP-1", vec![l.id], &l, false), port_only];
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs, leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         let log = Mutex::new(LogFile::open(&tmp.join("device-launched.log")).unwrap());
@@ -3863,7 +4235,7 @@ mod tests {
         let l = ls.grant(id, "w1:p1", None, None, None, None, true, 0);
         let mut p = my_app("TASK-1", vec![], &l, false);
         p.device = None;
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp");
         std::fs::create_dir_all(&tmp).unwrap();
         let log = Mutex::new(LogFile::open(&tmp.join("lock-wait.log")).unwrap());
@@ -3950,6 +4322,8 @@ mod tests {
             only: false,
             branch: None,
             problems: None,
+            usage: None,
+            awaits_slot: false,
             timed_out: false,
             t,
         }
@@ -4027,7 +4401,7 @@ mod tests {
         let l = ls.grant(id, "w1:p1", None, None, None, None, true, 0);
         let mut p = my_app("TOY-1", vec![], &l, false);
         (p.kind, p.device) = ("test".into(), None);
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![p], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(64).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         let log = Mutex::new(LogFile::open(&scratch().join("toy.log")).unwrap());
         exec(&d, "TOY-1", &log, &Toy, Toy.run(&t, &Ctx::default()), &HashMap::new(), None, St::Running).await;
         let tests = d.lock().procs[0].tests.clone().unwrap();
@@ -4068,7 +4442,7 @@ mod tests {
         let kind = ToyPlatform.resolve(&[], &Value::Null, None, None).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ls = Leases { retire: Some(tx), ..Default::default() };
-        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0 }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0 });
+        let d: D = Arc::new(Daemon { st: Mutex::new(State { procs: vec![], leases: ls, stopping: false, writing: HashSet::new(), pruned_at: 0, slots: Slots::default() }), tx: broadcast::channel(16).0, dir: scratch(), logs: scratch(), built: 0, wake: Default::default() });
         // A template of the same kind: the default clone refuses, so the device is created instead.
         let tm = Sim { udid: "TMPL".into(), name: "t".into(), device: kind.device_name.clone(), runtime: kind.runtime_name.clone(), slim: None, platform: "toy".into() };
         let (l, note, slimmed) = new_sim(&d, &ToyPlatform, "w1:p1", None, kind.clone(), false, None, Some(tm.clone()), Some(vec![])).await.unwrap();

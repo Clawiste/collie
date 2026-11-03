@@ -47,6 +47,9 @@ collie is the shared layer underneath:
 - **Physical iPhones and iPads** — signed builds, install and launch, with a queue when someone else holds the
   device.
 - **Throwaway Postgres and Redis** — one Docker container per dib, on a free port, deleted on release.
+- **Build slots** — only so many builds, `exec` commands and test runs at once; fewer while the slot holders'
+  processes use too much CPU or memory, with every build but one slowed to background priority (never below one).
+  CI jobs on the same machine join the queue, ahead of agents.
 - **History** — ended runs and their logs, kept 7 days.
 - **A terminal UI** — targets, tests, history, problems and live logs in one pane (`collie tui`), standalone
   or inside herdr.
@@ -176,11 +179,77 @@ cmd = "tuist generate --no-open"
 watch = ["Project.swift", "Tuist", "Package.swift", "Package.resolved"]
 ```
 
+Machine-wide limits live in `~/.config/collie/config.toml`, read again every 5 seconds, so an edit applies without
+restarting the daemon:
+
+```toml
+[builds]
+max = 2       # most builds at once; default: cores / 4, at least 1
+cpu = 70      # % of all cores the slot holders' processes may use before the cap drops
+memory = 50   # % of RAM
+```
+
+Over a threshold for 10 s lowers the cap by one (never below 1) and moves every build but one to background
+priority (the oldest CI job keeps full speed, else the oldest build); 30 s under 80% of both raises it again.
+`collie status` shows the cap, the queue and each process's CPU and memory, summed over its whole process tree.
+
 | Environment variable | Effect |
 | --- | --- |
 | `COLLIE_HOLDER` | Who you are to collie, when you want separate ownership within one session |
 | `COLLIE_STATE_DIR` | Isolated state, socket and logs (default `~/.local/state/collie`) |
 | `SIMCTL_CHILD_<NAME>` / `DEVICECTL_CHILD_<NAME>` | Passed to the iOS app as `<NAME>` |
+
+### CI on the same machine
+
+A GitHub Actions self-hosted runner on a collie host can make each job hold a build slot, ahead of waiting agents,
+with no workflow change: the runner's job hooks take the slot for the job's worker process and give it back.
+
+```sh
+# job-started.sh
+export COLLIE_HOLDER=ci
+/Users/<you>/.local/bin/collie dibs acquire build --wait --priority ci --pid "$PPID" \
+  --name "$GITHUB_REPOSITORY#$GITHUB_RUN_NUMBER" || echo "collie: no build slot taken"
+```
+
+```sh
+# job-completed.sh
+COLLIE_HOLDER=ci /Users/<you>/.local/bin/collie dibs release --pid "$PPID" || true
+```
+
+In the runner's `.env`, then restart the runner service:
+
+```
+ACTIONS_RUNNER_HOOK_JOB_STARTED=/abs/path/job-started.sh
+ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/abs/path/job-completed.sh
+```
+
+- The slot belongs to `$PPID`, the job's worker: its process tree counts toward the limits, and the slot is freed
+  within about 5 s of it exiting (a cancelled job included), even if the completed hook never runs.
+- `|| …`: a failing hook can fail the job, and collie being down must never break CI; the job then runs without a
+  slot. A job waiting for a slot when the daemon restarts carries on without one too.
+- Absolute paths: the runner's `PATH` may lack `~/.local/bin`.
+- The runner must run as your own macOS user, with the same `HOME` (and `COLLIE_STATE_DIR`, if set): the socket is
+  per user and state dir, and another account would get a daemon and a queue of its own. `collie status` from a hook
+  shows which one it reached.
+- Keep the daemon out of the runner's reach: started from a job, it would be the job's child, and the runner kills
+  what a job leaves behind — the daemon, and every process it runs. So `collie` doesn't start a daemon inside a job
+  (`RUNNER_TRACKING_ID` set); run it as a LaunchAgent instead, in `~/Library/LaunchAgents/dev.collie.daemon.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.collie.daemon</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/you/.local/bin/collie</string><string>daemon</string><string>--foreground</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+`launchctl load ~/Library/LaunchAgents/dev.collie.daemon.plist` starts it (stop a running daemon first).
 
 ## Who owns what
 
@@ -190,8 +259,8 @@ Every request carries a **holder**:
 - In Claude Code, your session (`claude:<session id>`), shared by its subagents.
 - Otherwise `COLLIE_HOLDER`, or the calling shell.
 
-Dibs last until released or their 2h TTL; processes run until stopped. `--take` stops another holder's process and
-takes the target over, so use it only on purpose.
+Dibs last until released or their 2h TTL, and a build dib until its process exits; processes run until stopped.
+`--take` stops another holder's process and takes the target over, so use it only on purpose.
 
 ## herdr plugin
 
@@ -215,8 +284,6 @@ Ideas being explored, not built yet:
 
 - **Remote execution** — run the daemon on another Mac (a Mac mini build box) and drive it from a laptop over SSH,
   with logs and status streaming back.
-- **CI as a collie client** — CI jobs join the same queue as agents, with priority.
-- **Build pressure limits** — cap concurrent builds by collie's own CPU and memory use, never below one.
 
 ## Development
 

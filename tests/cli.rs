@@ -28,7 +28,9 @@ impl Daemon {
             .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/node-app"))
             .env("COLLIE_STATE_DIR", &self.0)
             .env("HERDR_SOCKET_PATH", self.0.join("no-herdr.sock"))
-            .env("HERDR_PANE_ID", holder);
+            .env("HERDR_PANE_ID", holder)
+            // Inside a GitHub Actions job, it would stop the client starting a daemon.
+            .env_remove("RUNNER_TRACKING_ID");
         cmd
     }
 
@@ -113,6 +115,87 @@ watch = ["src"]
     assert_eq!(run(), 2, "a file added under a watched dir");
     let out = d.cmd("t:p1", &["logs", "hi"]).current_dir(&repo).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("collie: prepare"), "logged with the build: {}", String::from_utf8_lossy(&out.stdout));
+}
+
+#[test]
+fn builds_beyond_the_cap_queue_for_a_slot_in_arrival_order() {
+    let d = Daemon::new("build-slots");
+    std::fs::write(d.0.join("config.toml"), "[builds]\nmax = 1\n").unwrap();
+    let (ok, a) = d.collie("t:p1", &["exec", "--name", "a", "--", "sleep", "2"]);
+    assert!(ok, "{a}");
+    let (ok, b) = d.collie("t:p1", &["exec", "--name", "b", "--", "true"]);
+    assert!(ok, "{b}");
+    let b_id = b["id"].as_str().unwrap();
+    let (_, status) = d.collie("t:p1", &["status"]);
+    let proc_b = status["processes"].as_array().unwrap().iter().find(|p| p["id"] == b_id).unwrap();
+    assert_eq!((&proc_b["state"], &proc_b["awaits_slot"]), (&"queued".into(), &true.into()), "{status}");
+    assert_eq!(status["builds"]["cap"], 1, "{status}");
+    assert_eq!(status["builds"]["queued"], serde_json::json!([b_id]), "{status}");
+    let (ok, err) = d.collie("t:p1", &["wait", "--until", "exited", "--timeout", "300", "b"]);
+    assert!(!ok);
+    assert!(err["error"]["message"].as_str().unwrap().contains("still queued for a build slot (1 of 1 build slots busy: a"), "{err}");
+    let (ok, b) = d.collie("t:p1", &["wait", "--until", "exited", "--timeout", "15000", "b"]);
+    assert!(ok, "{b}");
+    let (_, status) = d.collie("t:p1", &["status"]);
+    let proc_a = status["processes"].as_array().unwrap().iter().find(|p| p["target"] == "a").unwrap();
+    assert!(proc_a["ended_at"].as_u64() <= b["ended_at"].as_u64(), "b ran only after a ended: {status}");
+    assert_eq!(status["builds"]["running"], serde_json::json!([]), "both gave their slot back: {status}");
+}
+
+#[test]
+fn a_ci_build_dib_holds_a_slot_goes_first_and_ends_with_its_pid() {
+    let d = Daemon::new("build-dibs");
+    std::fs::write(d.0.join("config.toml"), "[builds]\nmax = 1\n").unwrap();
+    // Stand-ins for CI job workers; reaped once killed, as a zombie still shows in `ps`.
+    let job = || Command::new("sleep").arg("60").spawn().unwrap();
+    let (mut a, mut b, mut c) = (job(), job(), job());
+    let pid = |p: &std::process::Child| p.id().to_string();
+    let status = || d.collie("t:p1", &["status"]).1;
+    let (ok, la) = d.collie("t:ci", &["dibs", "acquire", "build", "--pid", &pid(&a), "--name", "A"]);
+    assert!(ok, "{la}");
+    let s = status();
+    assert_eq!(s["leases"][0]["pid"], a.id(), "{s}");
+    assert_eq!(s["builds"]["running"], serde_json::json!([format!("dibs:{}", la["id"])]), "{s}");
+    let (ok, x) = d.collie("t:p1", &["exec", "--name", "x", "--", "true"]);
+    assert!(ok, "{x}");
+    assert_eq!(status()["processes"][0]["awaits_slot"], true);
+    let waiter = d.cmd("t:ci", &["dibs", "acquire", "build", "--wait", "--priority", "ci", "--pid", &pid(&b), "--name", "B"]).stdout(Stdio::piped()).spawn().unwrap();
+    let t0 = std::time::Instant::now();
+    while status()["builds"]["queued"].as_array().map_or(0, Vec::len) < 2 && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let s = status();
+    assert!(s["builds"]["queued"][0].as_str().is_some_and(|q| q.starts_with("dibs:")), "B goes ahead of the earlier exec: {s}");
+    assert_eq!((&s["queue"][0]["resource"], &s["queue"][0]["priority"]), (&"build".into(), &"ci".into()), "{s}");
+    let (ok, err) = d.collie("t:ci", &["dibs", "acquire", "build", "--pid", &pid(&c)]);
+    assert_eq!((ok, &err["error"]["code"]), (false, &"busy".into()), "{err}");
+    assert!(err["error"]["message"].as_str().unwrap().contains("1 of 1 busy (A), 2 queued ahead"), "{err}");
+    let (ok, released) = d.collie("t:ci", &["dibs", "release", "--pid", &pid(&a)]);
+    assert!(ok, "{released}");
+    let lb: Value = serde_json::from_slice(&waiter.wait_with_output().unwrap().stdout).unwrap_or_default();
+    assert_eq!((&lb["pid"], &lb["priority"], &lb["name"]), (&b.id().into(), &"ci".into(), &"B".into()), "{lb}");
+    assert_eq!(status()["processes"][0]["awaits_slot"], true, "the exec still waits behind B");
+    b.kill().unwrap();
+    b.wait().unwrap();
+    // One 5 s sample notices; the rest is slack for a loaded machine.
+    let (ok, ran) = d.collie("t:p1", &["wait", "--until", "exited", "--timeout", "15000", "x"]);
+    assert!(ok, "B's slot is freed once its pid is gone: {ran}");
+    assert_eq!(status()["leases"], serde_json::json!([]));
+    let (ok, err) = d.collie("t:ci", &["dibs", "release", "--pid", &pid(&a)]);
+    assert_eq!((ok, &err["error"]["code"]), (false, &"not_found".into()), "{err}");
+    for p in [&mut a, &mut c] {
+        let _ = p.kill();
+        let _ = p.wait();
+    }
+}
+
+#[test]
+fn a_ci_job_never_starts_the_daemon() {
+    let d = Daemon::new("ci-no-daemon");
+    let out = d.cmd("t:ci", &["dibs", "acquire", "build", "--pid", "1"]).env("RUNNER_TRACKING_ID", "github_1").output().unwrap();
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+    assert_eq!(err["error"]["code"], "unavailable", "{err}");
+    assert!(!d.0.join("collie.sock").exists(), "no daemon started");
 }
 
 #[test]

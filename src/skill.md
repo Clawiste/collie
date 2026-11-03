@@ -114,6 +114,25 @@ by a signal ends `crashed` with `code` null and `signal` set (e.g. 9); a timed-o
 `signal` 15 (collie's TERM; 9 if it ignored that for 3 s). A run ended by `stop`, a takeover or a
 rerun is recorded in `history` as `crashed` with `signal` 15.
 
+## Build slots
+
+collie runs only so many builds at once: a target's build step, an `exec` command and a test run each take a
+build slot, an app's or server's run phase doesn't. With every slot taken, a process shows state `queued` with
+`"awaits_slot": true` and starts when one frees up, in arrival order. `wait` waits through it; its timeout line says
+`still queued for a build slot (2 of 2 build slots busy: <targets>…)`.
+
+- CI jobs on this machine hold build slots too, as build dibs (`resource: "build"`, holder `ci`, with `pid` and
+  `name`; in `builds.running` as `dibs:<id>`). They queue ahead of your builds and never preempt a running one.
+  Don't call `dibs acquire build` yourself: collie takes the slot for everything it runs.
+- A build dib ends when its `pid` exits or it is released, not with the 2h TTL (its `expires_at` isn't enforced).
+- The cap drops (never below 1) while the slot holders' processes use too much CPU or memory, and climbs back once
+  they don't. While it's lowered, every build but one runs at background priority: slower, never stopped. The one at
+  full speed is the oldest CI job, else the oldest build.
+- Don't work around a queue (running the build in your own shell, or stopping someone's build). Wait for it.
+- `collie status --json` shows `builds` (`cap`, `running`, `queued`, `usage`, `slowed`, `knobs`), and each process's
+  `usage` (`cpu` in percent of one core, summed over its process tree; `mem` in bytes).
+- The limits are the user's, in `~/.config/collie/config.toml`; never edit it unless asked.
+
 ## Sharing with others
 
 - `run` on a target someone else is running fails with code `held` and names the holder.
