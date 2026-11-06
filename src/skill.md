@@ -162,6 +162,11 @@ as for any process. `status --json` shows the other Mac's slots as `builds.remot
 environment, logged and shown in the Collie pane like a target. Use it for builds, checks and
 test runs instead of running them in your own shell.
 
+To build a project that has a target (`collie list`), such as an Xcode scheme or a cargo package,
+use `collie run <target>`, not `collie exec -- xcodebuild …` / `-- cargo build …`: only a target's
+build feeds `collie problems` and the pane's Problems tab, so an exec build's warnings and lint never
+show there. Keep `exec` for commands that are not a target's build.
+
 ```bash
 collie exec --json --name check -- cargo check --all --locked   # collie's flags go before `--`
 collie wait --until exited --timeout 540000 check   # repeat while it fails with code `timeout`
@@ -276,6 +281,15 @@ collie logs --level error "cargo test"              # the failing tests, panics 
 - Arguments for the test binaries go after a second `--`: `collie run "cargo test" -- -- --nocapture`.
 - Use `collie run "cargo test"`, not `collie exec -- cargo test …` at the workspace root: that exec's
   default name is also `cargo test`, so it replaces the target's process.
+
+### Build progress
+
+While a process builds (an `exec` of `cargo` or `xcodebuild` too), and only then, `status --json`, `run --json` and
+`wait` show `"progress": {"done", "total", "unit", "estimated", "targets"}`, absent otherwise. Cargo counts
+`crates` of a `total` it reports (`estimated: false`). Xcode counts `steps`, with
+`"targets": {"started", "total"}`. Its `total` is the step count of the last successful build of the same target in
+the same dir (`steps` in `history`), so `estimated: true`, or null when there is none. The progress lines themselves
+stay out of `logs`.
 
 ### Test results
 

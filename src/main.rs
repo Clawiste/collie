@@ -383,7 +383,15 @@ fn run(cli: &Cli) -> Result<()> {
             }
         }
         Cmd::Stop { target } => out(request("stop", json!({"target": target}))?),
-        Cmd::Status => out(request("status", json!({}))?),
+        Cmd::Status => {
+            let mut v = request("status", json!({}))?;
+            if !cli.json {
+                for p in v["processes"].as_array_mut().into_iter().flatten() {
+                    p["progress"] = tui::progress_text(&p["progress"], false).into();
+                }
+            }
+            out(v)
+        }
         Cmd::History { target, all, limit } => {
             let v = request("history", json!({"target": target, "here": !all, "limit": limit}))?;
             if cli.json {

@@ -12,7 +12,7 @@ use ratatui::widgets::Block;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 const VIEW_CAP: usize = 5000;
@@ -319,7 +319,28 @@ pub fn run() -> Result<()> {
     let res = (|| -> Result<()> {
         execute!(std::io::stdout(), EnableMouseCapture)?;
         loop {
-            while let Ok(frame) = rx.try_recv() {
+            // Each status replaces the one before, so only the newest of a batch is handled: handling every one let a
+            // busy daemon queue them faster than the pane got through them, at full CPU and ever more memory.
+            let frames: Vec<Value> = rx.try_iter().collect();
+            let newest = frames.iter().rposition(|f| f["event"] == "status");
+            let lagged = frames.iter().any(|f| f["event"] == "status" && f["lagged"] == true);
+            // A process that came and went within the batch is in none but a skipped frame: `on_event` must still
+            // reload history for it.
+            let ids = |f: &Value| f["data"]["processes"].as_array().into_iter().flatten().map(|p| p["id"].clone()).collect::<Vec<_>>();
+            let dropped = newest.is_some_and(|n| {
+                let last = ids(&frames[n]);
+                frames.iter().filter(|f| f["event"] == "status").flat_map(ids).any(|id| !last.contains(&id))
+            });
+            for (i, mut frame) in frames.into_iter().enumerate() {
+                if frame["event"] == "status" && Some(i) != newest {
+                    continue;
+                }
+                if Some(i) == newest && lagged {
+                    frame["lagged"] = true.into();
+                }
+                if Some(i) == newest && dropped {
+                    frame["dropped"] = true.into();
+                }
                 app.on_event(frame);
             }
             if std::mem::take(&mut app.redraw) {
@@ -433,8 +454,15 @@ fn section(root: &Path, it: &Item, p: Option<&Value>) -> &'static str {
 
 /// Whether `dir` is in the worktree `root` (resolved).
 fn inside(root: &Path, dir: &Path) -> bool {
-    // Resolved like `root`: git reports `/private/tmp/…` while a caller's cwd may go through a symlink (`/tmp/…`).
-    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()).starts_with(root)
+    // Resolved once per dir: every status asks this for each history run, and history only grows.
+    // ponytail: a dir that later moves or becomes a symlink keeps its first answer until the pane restarts.
+    static RESOLVED: Mutex<Option<HashMap<PathBuf, PathBuf>>> = Mutex::new(None);
+    let mut resolved = RESOLVED.lock().unwrap();
+    let real = resolved.get_or_insert_default().entry(dir.to_path_buf()).or_insert_with(|| {
+        // Resolved like `root`: git reports `/private/tmp/…` while a caller's cwd may go through a symlink (`/tmp/…`).
+        std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+    });
+    real.starts_with(root)
 }
 
 fn on_sim(t: &Value) -> bool {
@@ -912,7 +940,7 @@ impl App {
                 let before = self.selected().map(|i| (i.name.clone(), i.dir.clone()));
                 let ids = |s: &Value| s["processes"].as_array().into_iter().flatten().map(|p| text(&p["id"]).to_string()).collect::<HashSet<_>>();
                 // A stop or a rerun drops processes from `status`, ended ones too; the daemon has recorded them by then.
-                let dropped = !ids(&self.status).is_subset(&ids(&frame["data"]));
+                let dropped = frame["dropped"] == true || !ids(&self.status).is_subset(&ids(&frame["data"]));
                 self.status = frame["data"].clone();
                 if dropped && let Ok(v) = request_with("history", json!({}), false) {
                     self.history = v["runs"].as_array().cloned().unwrap_or_default();
@@ -1885,6 +1913,9 @@ impl App {
             };
             let p = &self.running[i].1;
             let mut spans = vec![Span::raw(format!("{} {} ", if sel == Some(i) { "›" } else { " " }, text(&p["target"]))), badge(p)];
+            if let Some(s) = progress_text(&p["progress"], inner.width < 40) {
+                spans.push(format!(" {s}").dim());
+            }
             if p["kind"] == "exec" {
                 spans.push(" (exec)".dim());
             }
@@ -2172,6 +2203,9 @@ impl App {
             if let Some(p) = self.proc_of(it) {
                 spans.push(" ".into());
                 spans.push(badge(p));
+                if let Some(s) = progress_text(&p["progress"], inner.width < 40) {
+                    spans.push(format!(" {s}").dim());
+                }
             }
             let line = Line::from(spans);
             f.render_widget(if i == self.sel && self.run.is_none() { line.reversed() } else { line }, row);
@@ -2282,6 +2316,9 @@ impl App {
         match &p {
             Some(p) => {
                 info.push(badge(p));
+                if let Some(s) = progress_text(&p["progress"], narrow) {
+                    info.push(format!(" {s}").dim());
+                }
                 info.push(format!("  {}", who(text(&p["holder"]), &p["agent"].as_str().map(Into::into))).into());
                 let since = p["since"].as_u64().unwrap_or_default();
                 info.push(match p["ended_at"].as_u64() {
@@ -2788,6 +2825,28 @@ fn remote_slots(r: &Value) -> Option<String> {
     let n = |k: &str| r[k].as_u64().unwrap_or_default();
     let queued = if n("queued") > 0 { format!(", {} queued", n("queued")) } else { String::new() };
     Some(format!("{host}: {} of {} slots free{queued}", n("cap").saturating_sub(n("running")), n("cap")))
+}
+
+/// A build's `progress`: `▓▓░░░░░░ 31/126 crates`, `target 2/4 · ~210/323 steps` (`~`: the last build's count),
+/// `target 2/4 · 57 steps` with no total, or past an estimated one; `narrow`, the count alone. None without progress.
+pub fn progress_text(pr: &Value, narrow: bool) -> Option<String> {
+    let (done, unit) = (pr["done"].as_u64()?, pr["unit"].as_str()?);
+    let est = if pr["estimated"] == true { "~" } else { "" };
+    let total = pr["total"].as_u64().filter(|&t| est.is_empty() || done <= t);
+    let count = match total {
+        Some(t) => format!("{est}{done}/{t} {unit}"),
+        None => format!("{done} {unit}"),
+    };
+    let lead = match (narrow, pr["targets"].as_object(), total) {
+        (true, ..) => String::new(),
+        (false, Some(t), _) => format!("target {}/{} · ", t["started"], t["total"]),
+        (false, None, Some(t)) if est.is_empty() => {
+            let n = (done * 8 / t.max(1)).min(8) as usize;
+            format!("{}{} ", "▓".repeat(n), "░".repeat(8 - n))
+        }
+        _ => String::new(),
+    };
+    Some(lead + &count)
 }
 
 fn badge(p: &Value) -> Span<'static> {

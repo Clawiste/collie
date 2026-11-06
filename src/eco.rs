@@ -2,6 +2,7 @@ use crate::logs::Record;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,13 +66,37 @@ pub struct Ctx {
     pub log: PathBuf,
 }
 
+/// How far a build has got (`Proc.progress`): `done` of `total` `unit`s (`crates`, `steps`). `estimated` when `total`
+/// is the step count of an earlier build rather than the tool's own; `targets` from Xcode's dependency graph.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Progress {
+    pub done: u64,
+    pub total: Option<u64>,
+    pub unit: &'static str,
+    pub estimated: bool,
+    pub targets: Option<Targets>,
+    /// Targets named in Xcode's step headers so far.
+    #[serde(skip)]
+    seen: HashSet<String>,
+    /// In an Xcode step or the dependency graph, whose indented lines follow its first line.
+    #[serde(skip)]
+    step: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct Targets {
+    pub started: u64,
+    pub total: u64,
+}
+
 /// A kind of project collie detects and runs. Adding one:
 /// - implement the required methods: `id`, `detect` (its targets in a dir), `needs` (port, simulator, device),
 ///   `build` (None: no build step), `run` and `classify` (a log line's level);
 /// - override what it supports: `launched` (an app's launch line), `results` (an ended test run's tests), `select`
 ///   (`run --only`), `check_args` (refusing run args its run phase would drop), `outcome` (live test counts),
-///   `continues` (lines that belong to the record before them, as a diagnostic's source excerpt does) and `platform`
-///   (where its devices come from: an existing `Platform`, or a new one registered in `PLATFORMS`);
+///   `progress` (live build progress), `continues` (lines that belong to the record before them, as a diagnostic's
+///   source excerpt does) and `platform` (where its devices come from: an existing `Platform`, or a new one registered
+///   in `PLATFORMS`);
 /// - register it in `ECOSYSTEMS` (the daemon finds a target's ecosystem by `id` there);
 /// - add a project under `tests/fixtures/` and a test of `detect` and `run` on it in this file's test module, as the
 ///   existing adapters have.
@@ -107,6 +132,11 @@ pub trait Ecosystem: Sync {
     /// The outcome (`passed`, `failed`, `skipped`) a run-phase line reports for one test, for live totals.
     fn outcome(&self, _line: &str) -> Option<&'static str> {
         None
+    }
+    /// Reads build progress from raw build line `line` (any line of an exec) into `p`, one per output stream, and
+    /// returns what of the line belongs in the log: None for none (a progress bar, a build step's header and command).
+    fn progress<'a>(&self, line: &'a str, _p: &mut Option<Progress>) -> Option<Cow<'a, str>> {
+        Some(line.into())
     }
     /// Whether raw `line` continues the open record (whose first line is `open`) rather than starting one: the daemon
     /// joins such lines to that record, and classifies the record by its first line alone.
@@ -360,6 +390,42 @@ fn libtest_outcome(line: &str) -> Option<&'static str> {
     }
 }
 
+/// Cargo's progress bar (`CARGO_TERM_PROGRESS_WHEN=always`), `    Building [=====>   ] 31/126: serde_core, …`, which a
+/// pipe gets as `\r`-separated segments ahead of the line that follows it. Returns the newest `Building` count and the
+/// line without bar segments or the blanks cargo clears them with: None when nothing is left, `line` itself without bars.
+fn cargo_bar(line: &str) -> (Option<(u64, u64)>, Option<Cow<'_, str>>) {
+    let bar = |seg: &str| -> Option<(String, (u64, u64))> {
+        if !seg.contains(" [") {
+            return None;
+        }
+        let p = plain(seg);
+        let (label, rest) = p.trim_start().split_once(" [")?;
+        let (filled, after) = rest.split_once("] ")?;
+        if label.is_empty() || !label.chars().all(|c| c.is_ascii_alphabetic()) || !filled.chars().all(|c| matches!(c, '=' | '>' | ' ')) {
+            return None;
+        }
+        if filled.is_empty() && label != "Building" {
+            return None;
+        }
+        let count = after.split([':', ' ']).next().and_then(|c| c.split_once('/')).and_then(|(n, m)| Some((n.parse().ok()?, m.parse().ok()?)))?;
+        Some((label.to_string(), count))
+    };
+    let (mut count, mut bars, mut kept) = (None, false, vec![]);
+    for seg in line.split('\r') {
+        match bar(seg) {
+            Some((label, c)) => (count, bars) = (Some(c).filter(|_| label == "Building").or(count), true),
+            // `plain`: under `CARGO_TERM_COLOR=always` cargo clears its bar with `\x1b[K`.
+            None if !plain(seg).trim().is_empty() => kept.push(seg),
+            None => {}
+        }
+    }
+    match (bars, kept.is_empty()) {
+        (false, _) => (None, Some(line.into())),
+        (true, true) => (count, None),
+        (true, false) => (count, Some(kept.join("\n").into())),
+    }
+}
+
 /// XCTest's `Test Case '…' passed (…)` and Swift Testing's `✔ Test … passed after …` (`􁁛`/`􀢄` on macOS). Anchored
 /// like `test_failed`; suite and run summaries, and Swift Testing's `recorded an issue`, report none.
 fn xctest_outcome(line: &str) -> Option<&'static str> {
@@ -459,6 +525,11 @@ pub fn runs_xcode(argv: &[String]) -> bool {
     }
 }
 
+/// Whether `argv` runs cargo (argv[0] only, as `runs_xcode`), whose progress bar `CargoTool` reads.
+pub fn runs_cargo(argv: &[String]) -> bool {
+    argv.first().is_some_and(|a| Path::new(a).file_name().is_some_and(|n| n == "cargo"))
+}
+
 /// The command `t` runs, as words: an exec's own `args`; a task's `collie.toml` line split on whitespace; else none.
 pub fn command_of(t: &Target, args: &[String]) -> Vec<String> {
     match (t.ecosystem.as_str(), t.kind.as_str()) {
@@ -536,6 +607,7 @@ impl Ecosystem for Cargo {
 
     fn build(&self, t: &Target, ctx: &Ctx) -> Option<Command> {
         let mut cmd = Command::new("cargo");
+        cmd.envs(cargo_progress_env(&ctx.env));
         if t.kind == "test" {
             // The run's args (`-p alpha`, a filter, `-- --nocapture`), so the build compiles only what the run needs; but
             // not `--doc`, which cargo refuses with `--no-run` (doc tests are compiled by the run itself).
@@ -625,6 +697,26 @@ impl Ecosystem for Cargo {
 
     fn outcome(&self, line: &str) -> Option<&'static str> {
         libtest_outcome(line)
+    }
+
+    fn progress<'a>(&self, line: &'a str, p: &mut Option<Progress>) -> Option<Cow<'a, str>> {
+        let (count, kept) = cargo_bar(line);
+        if let Some((done, total)) = count {
+            *p = Some(Progress { done, total: Some(total), unit: "crates", ..Default::default() });
+        }
+        let build_over = kept.as_deref().is_some_and(|k| plain(k).trim_start().starts_with("Finished "));
+        if build_over {
+            *p = None;
+        }
+        kept
+    }
+}
+
+/// Env that makes cargo print its progress bar into collie's pipe, unless the caller's `env` sets its own.
+pub fn cargo_progress_env(env: &HashMap<String, String>) -> Vec<(&'static str, &'static str)> {
+    match env.contains_key("CARGO_TERM_PROGRESS_WHEN") {
+        true => vec![],
+        false => vec![("CARGO_TERM_PROGRESS_WHEN", "always"), ("CARGO_TERM_PROGRESS_WIDTH", "100")],
     }
 }
 
@@ -828,12 +920,62 @@ impl Ecosystem for XcodeTool {
         Task.outcome(line)
     }
 
+    fn progress<'a>(&self, line: &'a str, p: &mut Option<Progress>) -> Option<Cow<'a, str>> {
+        xcode_progress(line, p)
+    }
+
     fn continues(&self, open: &str, line: &str) -> bool {
         Task.continues(open, line)
     }
 
     fn platform(&self) -> Option<&'static dyn Platform> {
         Some(&Ios)
+    }
+}
+
+/// A task or exec that runs cargo (`runs_cargo`): a `Task` that also reads cargo's progress bar. Its own type so that no
+/// other command's lines go through `cargo_bar`.
+pub struct CargoTool;
+
+impl Ecosystem for CargoTool {
+    fn id(&self) -> &'static str {
+        Task.id()
+    }
+
+    fn detect(&self, dir: &Path) -> Result<Vec<Target>> {
+        Task.detect(dir)
+    }
+
+    fn needs(&self, t: &Target) -> Vec<Resource> {
+        Task.needs(t)
+    }
+
+    fn build(&self, t: &Target, ctx: &Ctx) -> Option<Command> {
+        Task.build(t, ctx)
+    }
+
+    fn run(&self, t: &Target, ctx: &Ctx) -> Command {
+        Task.run(t, ctx)
+    }
+
+    fn classify(&self, src: Source, line: &str) -> (Level, String) {
+        Task.classify(src, line)
+    }
+
+    fn outcome(&self, line: &str) -> Option<&'static str> {
+        Task.outcome(line)
+    }
+
+    fn progress<'a>(&self, line: &'a str, p: &mut Option<Progress>) -> Option<Cow<'a, str>> {
+        Cargo.progress(line, p)
+    }
+
+    fn continues(&self, open: &str, line: &str) -> bool {
+        Task.continues(open, line)
+    }
+
+    fn platform(&self) -> Option<&'static dyn Platform> {
+        Task.platform()
     }
 }
 
@@ -1241,6 +1383,45 @@ fn xcode_level(line: &str) -> Level {
     }
 }
 
+/// xcodebuild's log (without `-quiet`): `note: Target dependency graph (4 targets)` gives the target count, and each step
+/// header, unindented and ending `(in target 'C' from project 'P')`, counts a step. Left out of the log: blank lines, the
+/// header and the indented command lines under it, and the graph's indented `Target '…'` lines (each to a blank or
+/// unindented line). Everything else stays, diagnostics with their indented excerpts and the tool's output included.
+fn xcode_progress<'a>(line: &'a str, p: &mut Option<Progress>) -> Option<Cow<'a, str>> {
+    let new = || Progress { unit: "steps", ..Default::default() };
+    if line.trim().is_empty() {
+        if let Some(p) = p {
+            p.step = false;
+        }
+        return None;
+    }
+    let indented = line.starts_with([' ', '\t']);
+    let graph = line.strip_prefix("note: Target dependency graph (").and_then(|r| r.strip_suffix(" targets)").or_else(|| r.strip_suffix(" target)")));
+    if let Some(n) = graph.and_then(|n| n.parse().ok()) {
+        let p = p.get_or_insert_with(new);
+        p.targets = Some(Targets { started: p.seen.len() as u64, total: n });
+        p.step = true;
+        return Some(line.into());
+    }
+    if let Some(p) = p.as_mut().filter(|p| p.step) {
+        if indented {
+            return None;
+        }
+        p.step = false;
+    }
+    // A rule name (`SwiftCompile`, `Ld`) first: a warning about a target ends in `(in target …)` too.
+    let rule = |head: &str| head.split(' ').next().is_some_and(|w| w.starts_with(|c: char| c.is_ascii_uppercase()) && w.chars().all(|c| c.is_ascii_alphanumeric()));
+    let header = line.strip_suffix("')").and_then(|l| l.rsplit_once(" (in target '")).filter(|(head, _)| !indented && rule(head));
+    let Some((target, _)) = header.and_then(|(_, t)| t.split_once("' from project '")) else { return Some(line.into()) };
+    let p = p.get_or_insert_with(new);
+    (p.done, p.step) = (p.done + 1, true);
+    p.seen.insert(target.into());
+    if let Some(t) = &mut p.targets {
+        t.started = p.seen.len() as u64;
+    }
+    None
+}
+
 impl Ecosystem for Xcode {
     fn id(&self) -> &'static str {
         "xcode"
@@ -1319,7 +1500,8 @@ impl Ecosystem for Xcode {
 
     fn build(&self, t: &Target, ctx: &Ctx) -> Option<Command> {
         let cmd = Self::xcodebuild(t, ctx, Path::new("/Applications")).map(|mut c| {
-            c.args([if t.kind == "test" { "build-for-testing" } else { "build" }, "-quiet"]);
+            // Not `-quiet`, which hides the step headers `progress` counts; `progress` keeps them out of the log.
+            c.arg(if t.kind == "test" { "build-for-testing" } else { "build" });
             if ctx.device.is_some() {
                 c.arg("-allowProvisioningUpdates");
             }
@@ -1390,6 +1572,10 @@ impl Ecosystem for Xcode {
 
     fn outcome(&self, line: &str) -> Option<&'static str> {
         xctest_outcome(line)
+    }
+
+    fn progress<'a>(&self, line: &'a str, p: &mut Option<Progress>) -> Option<Cow<'a, str>> {
+        xcode_progress(line, p)
     }
 
     fn continues(&self, _: &str, line: &str) -> bool {
@@ -2438,7 +2624,7 @@ mod tests {
         assert_eq!(Xcode.needs(&ts[2]), [], "no simulator, device or port");
         // No device to name: a generic destination, or none (the fixture has no project to ask for its platforms).
         let args = Xcode.build(&ts[2], &Ctx::default()).unwrap().get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
-        assert!(args.contains("-scheme Widget") && args.ends_with("build -quiet") && !args.contains("id="), "{args}");
+        assert!(args.contains("-scheme Widget") && args.ends_with(" build") && !args.contains("id="), "{args}");
         assert!(!builds("<Scheme><BuildAction><BuildActionEntries></BuildActionEntries></BuildAction></Scheme>"), "nothing to build: skipped");
         assert_eq!(generic_for(&["iphoneos", "iphonesimulator"]), Some("generic/platform=iOS Simulator"));
         assert_eq!(generic_for(&["macosx", "iphonesimulator"]), Some("generic/platform=iOS Simulator"));
@@ -2464,14 +2650,14 @@ mod tests {
         let ctx = Ctx { simulator: Some("U".into()), log: "/logs/p1.log".into(), ..Default::default() };
         let args = |c: Command| c.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ");
         let (app_tests, core) = (&ts[1], &ts[2]);
-        assert!(args(Xcode.build(app_tests, &ctx).unwrap()).ends_with("-scheme My App -destination id=U build-for-testing -quiet"), "the app scheme's own name");
+        assert!(args(Xcode.build(app_tests, &ctx).unwrap()).ends_with("-scheme My App -destination id=U build-for-testing"), "the app scheme's own name");
         let run = args(Xcode.run(core, &ctx));
         let want = "-scheme CoreTests -destination id=U test-without-building -test-timeouts-enabled YES -maximum-test-execution-time-allowance 600 -collect-test-diagnostics never -resultBundlePath /logs/p1.xcresult";
         assert!(run.ends_with(want), "{run}");
         assert!(run.contains("bootstatus") && run.contains(" sh U xcodebuild -workspace "), "the simulator is booted first: {run}");
         let phone = Ctx { device: Some("P".into()), ..Default::default() };
         assert_eq!(Xcode.run(core, &phone).get_program(), "xcodebuild", "a physical device isn't");
-        assert!(args(Xcode.build(&ts[0], &ctx).unwrap()).ends_with("build -quiet"), "the app still builds");
+        assert!(args(Xcode.build(&ts[0], &ctx).unwrap()).ends_with(" build"), "the app still builds");
         std::fs::copy(fixture("xcode-user-scheme.xcscheme"), schemes.join("My App (test).xcscheme")).unwrap();
         let e = Xcode.detect(&tmp.join("xcode-ws")).unwrap_err();
         assert_eq!(e.downcast_ref::<crate::daemon::Coded>().unwrap().0, "bad_config");
@@ -2628,5 +2814,70 @@ mod tests {
         for want in ["Xcode 99.0", "27.0 at ", "27.1 at ", "Xcode-27.1.0.app", "xcodes install 99.0"] {
             assert!(e.contains(want), "{e}");
         }
+    }
+
+    #[test]
+    fn cargos_bar_counts_crates_and_stays_out_of_the_log() {
+        let mut p = None;
+        // As collie records it from cargo 1.96 with `CARGO_TERM_PROGRESS_WHEN=always`.
+        let mixed = "    Building [=====>                    ] 31/126: serde_core, parking_lot_core(build), itertools,…\r   Compiling smallvec v1.16.4";
+        assert_eq!(Cargo.progress(mixed, &mut p).as_deref(), Some("   Compiling smallvec v1.16.4"), "the text after the bar stays");
+        let pr = p.clone().unwrap();
+        assert_eq!((pr.done, pr.total, pr.unit, pr.estimated, pr.targets), (31, Some(126), "crates", false, None));
+        let only = "    Building [======>                   ] 40/126: a\r    Building [=======>                  ] 52/126: b\r                    ";
+        assert_eq!(Cargo.progress(only, &mut p), None, "bars and cargo's clearing blanks alone: dropped");
+        assert_eq!(p.as_ref().unwrap().done, 52, "the newest count");
+        let line = "   Compiling smallvec v1.16.4";
+        assert!(matches!(Cargo.progress(line, &mut p), Some(Cow::Borrowed(l)) if l == line), "a line without a bar is untouched");
+        let coloured = "\x1b[1m\x1b[36m    Building\x1b[0m [=>  ] 3/9: x\r\x1b[K";
+        assert_eq!(CargoTool.progress(coloured, &mut p), None, "coloured, with its clearing escape, for an exec of cargo");
+        assert_eq!(p.as_ref().unwrap().done, 3);
+        let mut other = None;
+        assert_eq!(Task.progress(coloured, &mut other).as_deref(), Some(coloured), "another exec's lines are all kept");
+        for line in ["Warning [] cache miss", "TODO [ ] finish", "Notes [==] 3 left"] {
+            assert_eq!(Cargo.progress(line, &mut other).as_deref(), Some(line), "no `n/m` count: no bar");
+        }
+        assert!(other.is_none());
+        let finished = "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.82s";
+        assert_eq!(Cargo.progress(finished, &mut p).as_deref(), Some(finished));
+        assert!(p.is_none(), "the build is over: no progress for what an exec runs after it");
+        let mut none = None;
+        assert_eq!(Cargo.progress("a [b] c\rd", &mut none).as_deref(), Some("a [b] c\rd"), "no bar: kept whole, \\r and all");
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn xcode_counts_steps_and_targets_and_keeps_diagnostics_inside_a_step() {
+        let diag = std::fs::read_to_string(fixture("swiftc-diagnostic.txt")).unwrap();
+        let header = "SwiftCompile normal arm64 /p/Sources/C/F.swift (in target 'C' from project 'Prog')";
+        let mut lines = vec![
+            "note: Building targets in dependency order",
+            "note: Target dependency graph (4 targets)",
+            "    Target 'C' in project 'Prog'",
+            "        ➜ Explicit dependency on target 'A' in project 'Prog'",
+            "    Target 'A' in project 'Prog' (no dependencies)",
+            "",
+            header,
+            "    cd /p",
+            "    builtin-swiftTaskExecution -- /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend -c",
+        ];
+        lines.extend(diag.lines());
+        lines.extend(["", "SwiftDriverJobDiscovery normal arm64 Compiling F5.swift (in target 'D' from project 'Prog')", "    cd /p", ""]);
+        lines.push("/p/Sources/D/G.swift:1:1: warning: Run script build phase 'Lint' will be run during every build (in target 'D' from project 'Prog')");
+        lines.push("** BUILD SUCCEEDED **");
+        let mut p = None;
+        let kept: Vec<String> = lines.iter().filter_map(|l| Xcode.progress(l, &mut p).map(Cow::into_owned)).collect();
+        let pr = p.unwrap();
+        assert_eq!((pr.done, pr.total, pr.unit, pr.targets), (2, None, "steps", Some(Targets { started: 2, total: 4 })), "the warning ending `(in target …)` is no step");
+        let diag: Vec<&str> = diag.lines().filter(|l| !l.trim().is_empty()).collect();
+        let mut want: Vec<&str> = lines[..2].to_vec();
+        want.extend(&diag);
+        want.extend(&lines[lines.len() - 2..]);
+        assert_eq!(kept, want, "left out: blanks, the graph's target lines, step headers and their indented commands");
+        assert!(kept.iter().any(|l| l.starts_with(" 85 |")), "a diagnostic's indented excerpt stays");
+        let recs = |ls: &[&str]| crate::daemon::group(ls, |h, l| Xcode.continues(h, l));
+        let kept: Vec<&str> = kept.iter().map(String::as_str).collect();
+        assert!(recs(&kept).windows(recs(&diag).len()).any(|w| w == recs(&diag)), "problems read the diagnostic with its excerpt and note as before: {:#?}", recs(&kept));
+        assert_eq!(recs(&kept).iter().filter(|r| diagnostic(r).is_some()).count(), 1 + recs(&diag).iter().filter(|r| diagnostic(r).is_some()).count());
     }
 }

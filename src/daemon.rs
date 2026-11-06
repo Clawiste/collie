@@ -422,6 +422,12 @@ struct Proc {
     tests: Option<Value>,
     /// Ran some of its tests only (`run`'s `only`), so `tests` aren't the whole suite's.
     only: bool,
+    /// While it builds, how far, as `eco::Progress`: sent at most every 500 ms. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<Value>,
+    /// The step count of its Xcode build, when that succeeded: the next build's estimated total.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps: Option<u64>,
     /// The git branch of its dir when it started; null when detached or outside git.
     branch: Option<String>,
     /// Its build problems' counts, `{"error", "warning", "lint"}` (the items are in `<id>.problems.json`); null for
@@ -795,11 +801,15 @@ fn emit_block(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, src: Sou
 
 /// With `watch`, asks the adapter whether each record's first line shows the app launched, until one does. Lines the
 /// adapter says continue a record (`Ecosystem::continues`) join it; a record goes out when the next one starts, the
-/// stream ends, or 200 ms pass without a line, so live output lags by that at most.
-async fn pump(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, r: impl AsyncRead + Unpin, src: Source, mut watch: bool) {
+/// stream ends, or 200 ms pass without a line, so live output lags by that at most. A build's (and an exec's) lines go
+/// through the adapter's `progress` first, which may leave some out; returns the stream's last progress, None once the
+/// build part of an exec is over.
+async fn pump(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, r: impl AsyncRead + Unpin, src: Source, mut watch: bool) -> Option<eco::Progress> {
     let mut lines = BufReader::new(r).split(b'\n');
-    let mut counted_at = 0;
+    let (mut counted_at, mut shown_at) = (0, 0);
     let mut block = Block::default();
+    let tracks = src == Source::Build || d.lock().procs.iter().any(|p| p.id == id && p.kind == "exec");
+    let (mut progress, mut shown, mut estimate) = (None::<eco::Progress>, None, None);
     loop {
         let next = match block.head.is_some() {
             // `next_segment` is cancellation safe: a timeout loses no input.
@@ -817,6 +827,34 @@ async fn pump(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, r: impl 
         let Ok(Some(l)) = next else { break };
         let raw = String::from_utf8_lossy(&l);
         let raw = raw.trim_end_matches('\r');
+        let raw = match tracks {
+            true => {
+                let kept = e.progress(raw, &mut progress);
+                let tests_started = e.outcome(raw).is_some();
+                if tests_started {
+                    progress = None;
+                }
+                if let Some(pr) = progress.as_mut().filter(|pr| pr.unit == "steps") {
+                    pr.total = *estimate.get_or_insert_with(|| last_steps(d, id));
+                    pr.estimated = pr.total.is_some();
+                }
+                let now = progress.as_ref().map(|pr| (pr.done, pr.total, pr.targets.clone()));
+                // ponytail: no trailing send; a change within 500 ms of the last one shows with the next line.
+                if now != shown && (now.is_none() || now_ms() >= shown_at + 500) {
+                    (shown, shown_at) = (now, now_ms());
+                    if let Some(p) = d.lock().procs.iter_mut().find(|p| p.id == id) {
+                        p.progress = progress.as_ref().map(|pr| json!(pr));
+                    }
+                    d.changed();
+                }
+                match kept {
+                    Some(k) => k,
+                    None => continue,
+                }
+            }
+            false => raw.into(),
+        };
+        let raw = raw.as_ref();
         let joins = block.head.as_ref().is_some_and(|(_, open)| e.continues(open, raw));
         let (starts, done) = block.push(now_ms(), raw, joins);
         if let Some(b) = done {
@@ -850,6 +888,14 @@ async fn pump(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, r: impl 
     if let Some(b) = block.take() {
         emit_block(d, id, log, e, src, b);
     }
+    progress
+}
+
+/// The step count of the newest Xcode build that succeeded of process `id`'s target in its dir, from history.
+fn last_steps(d: &D, id: &str) -> Option<u64> {
+    let (target, dir) = d.lock().procs.iter().find(|p| p.id == id).map(|p| (p.target.clone(), p.dir.clone()))?;
+    let _g = HISTORY.lock().unwrap();
+    read_history(&d.dir).iter().rev().find(|r| r["target"] == target.as_str() && r["dir"] == *dir.to_string_lossy() && r["steps"].is_u64())?["steps"].as_u64()
 }
 
 /// Serialises `[prepare]` runs and `prepared.json`: two builds in one repo mustn't generate its project at once.
@@ -899,7 +945,7 @@ async fn prepare(d: &D, id: &str, log: &Mutex<LogFile>, e: &dyn Ecosystem, dir: 
     say(Level::Info, format!("collie: prepare: {} (in {})", prep.cmd, root.display()));
     let mut cmd = std::process::Command::new("sh");
     cmd.args(["-c", &prep.cmd]).current_dir(&root);
-    let status = exec(d, id, log, e, cmd, env, None, St::Building).await;
+    let status = exec(d, id, log, e, cmd, env, None, St::Building).await.map(|(s, _)| s);
     if status.is_none() && moved(d, id) {
         return Err(None);
     }
@@ -967,8 +1013,8 @@ impl Drop for Slot {
     }
 }
 
-/// Runs one phase; None if it could not spawn or the process was stopped meanwhile. A build phase, and every phase of an
-/// exec or test run, first waits for a build slot.
+/// Runs one phase: its exit, and the Xcode steps it counted (`progress`); None if it could not spawn or the process was
+/// stopped meanwhile. A build phase, and every phase of an exec or test run, first waits for a build slot.
 async fn exec(
     d: &D,
     id: &str,
@@ -978,7 +1024,7 @@ async fn exec(
     env: &HashMap<String, String>,
     port: Option<u16>,
     phase: St,
-) -> Option<ExitStatus> {
+) -> Option<(ExitStatus, Option<u64>)> {
     // The adapter's env (DEVELOPER_DIR from .xcode-version) must beat the caller's, so it is applied again last.
     let own: Vec<_> = cmd.get_envs().filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned()))).collect();
     let mut cmd = tokio::process::Command::from(cmd);
@@ -1040,15 +1086,19 @@ async fn exec(
         st.leases.save();
     }
     let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-    let (status, _, _) = tokio::join!(child.wait(), pump(d, id, log, e, stdout, out, watch), pump(d, id, log, e, stderr, err, watch));
+    let (status, a, b) = tokio::join!(child.wait(), pump(d, id, log, e, stdout, out, watch), pump(d, id, log, e, stderr, err, watch));
     {
         let mut st = d.lock();
+        if let Some(p) = st.procs.iter_mut().find(|p| p.id == id) {
+            p.progress = None;
+        }
         st.writing.remove(id);
         st.leases.groups.retain(|(g, _)| Some(*g) != pid);
         st.leases.save();
     }
     d.changed();
-    status.ok()
+    let steps = [a, b].into_iter().flatten().find(|pr| pr.unit == "steps").map(|pr| pr.done);
+    status.ok().map(|s| (s, steps))
 }
 
 fn finish(d: &D, id: &str, status: Option<ExitStatus>) {
@@ -1083,6 +1133,16 @@ fn finish(d: &D, id: &str, status: Option<ExitStatus>) {
     }
     d.changed();
     prune_soon(d);
+}
+
+/// Gives process `id` the Xcode step count of its build `ran` (`exec`'s), when that succeeded.
+fn set_steps(d: &D, id: &str, ran: Option<(ExitStatus, Option<u64>)>) {
+    if let Some((s, Some(n))) = ran
+        && s.success()
+        && let Some(p) = d.lock().procs.iter_mut().find(|p| p.id == id)
+    {
+        p.steps = Some(n);
+    }
 }
 
 /// Appends the ended `p` to `history.jsonl`.
@@ -1131,7 +1191,8 @@ async fn lifecycle(
     let Ok(build) = tokio::task::spawn_blocking(move || e.build(&bt, &Ctx { simulator: bu, device: bd, head, env: be, args: ba, log: bl })).await else { return finish(&d, &id, None) };
     let builds = build.is_some();
     if let Some(cmd) = build {
-        let status = exec(&d, &id, &log, e, cmd, &env, port, St::Building).await;
+        let ran = exec(&d, &id, &log, e, cmd, &env, port, St::Building).await;
+        let status = ran.map(|(s, _)| s);
         if status.is_none() && moved(&d, &id) {
             return;
         }
@@ -1139,6 +1200,7 @@ async fn lifecycle(
             save_problems(&d, &id, &t, true).await;
             return finish(&d, &id, status);
         }
+        set_steps(&d, &id, ran);
         // A `build` target (a framework's scheme) has nothing to run: built, it is done.
         if t.kind == "build" {
             if let Some(p) = d.lock().procs.iter_mut().find(|p| p.id == id) {
@@ -1184,11 +1246,16 @@ async fn lifecycle(
         save_problems(&d, &id, &t, builds).await;
         return finish(&d, &id, None);
     };
-    let reader: &dyn Ecosystem = match (eco::runs_xcode(&eco::command_of(&t, &args)), on_device && t.ecosystem == "xcode" && t.kind == "app") {
+    let command = eco::command_of(&t, &args);
+    let reader: &dyn Ecosystem = match (eco::runs_xcode(&command), on_device && t.ecosystem == "xcode" && t.kind == "app") {
         (true, _) => &eco::XcodeTool,
         (false, true) => &eco::XcodeDevice,
+        (false, false) if eco::runs_cargo(&command) => &eco::CargoTool,
         (false, false) => e,
     };
+    if t.kind == "exec" && eco::runs_cargo(&command) {
+        cmd.envs(eco::cargo_progress_env(&env));
+    }
     cmd.args(args);
     if let Some(u) = to {
         cmd.env("COLLIE_UDID", u);
@@ -1196,7 +1263,8 @@ async fn lifecycle(
     // Started with the run phase only: a cold build may legitimately take long.
     let (ended, ended_rx) = oneshot::channel();
     let guard = limit.map(|limit| tokio::spawn(time_out(d.clone(), id.clone(), limit, ended_rx)));
-    let status = exec(&d, &id, &log, reader, cmd, &env, port, St::Running).await;
+    let ran = exec(&d, &id, &log, reader, cmd, &env, port, St::Running).await;
+    let status = ran.map(|(s, _)| s);
     // Awaited, not aborted: a guard that has fired finishes its kill (a TERM-ignoring group member can outlive the leader).
     let _ = ended.send(());
     if let Some(g) = guard {
@@ -1205,6 +1273,9 @@ async fn lifecycle(
     // Only now, with the guard told and done: an exec that moved while it waited for its slot.
     if status.is_none() && moved(&d, &id) {
         return;
+    }
+    if t.kind == "exec" {
+        set_steps(&d, &id, ran);
     }
     if let Some(limit) = limit.filter(|_| d.lock().procs.iter().any(|p| p.id == id && p.timed_out)) {
         let line = format!("collie: killed: its run phase outlived its kill limit of {} ms (`--timeout`); a simulator it ran on is replaced", limit.as_millis());
@@ -2389,6 +2460,8 @@ async fn run_target(d: &D, t: Target, holder: &str, p: &Value) -> Result<Value> 
         blocked: false,
         tests: None,
         only: !only.is_empty(),
+        progress: None,
+        steps: None,
         branch,
         problems: None,
         usage: None,
@@ -3578,6 +3651,7 @@ fn copy_remote(d: &D, id: &str, rp: &Value) -> bool {
     }
     (p.built, p.awaits_slot, p.blocked) = (rp["built"] == true, rp["awaits_slot"] == true, rp["blocked"] == true);
     p.tests = Some(rp["tests"].clone()).filter(|t| !t.is_null()).or(p.tests.take());
+    p.progress = Some(rp["progress"].clone()).filter(|v| !v.is_null());
     p.usage = serde_json::from_value(rp["usage"].clone()).ok();
     p.simulator = serde_json::from_value(rp["simulator"].clone()).ok();
     true
@@ -5187,6 +5261,8 @@ mod tests {
             blocked: false,
             tests: None,
             only: false,
+            progress: None,
+            steps: None,
             branch: None,
             problems: None,
             usage: None,

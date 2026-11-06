@@ -269,6 +269,23 @@ fn a_targets_build_warning_is_a_problem_and_an_exec_adds_none() {
 }
 
 #[test]
+fn a_cargo_execs_progress_bar_stays_out_of_its_log_and_history() {
+    let d = Daemon::new("cargo-bar");
+    let fake_cargo = d.0.join("cargo");
+    let script = "#!/bin/sh\n[ \"$CARGO_TERM_PROGRESS_WHEN\" = always ] || exit 9\nprintf '    Building [==>  ] 3/9: a\\r   Compiling x v1.0\\n    Building [===> ] 4/9: b\\r' >&2\n";
+    std::fs::write(&fake_cargo, script).unwrap();
+    std::fs::set_permissions(&fake_cargo, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = d.cmd("t:p1", &["exec", "--name", "bar", "--", fake_cargo.to_str().unwrap(), "build"]).env_remove("CARGO_TERM_PROGRESS_WHEN").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (ok, v) = d.collie("t:p1", &["wait", "--until", "exited", "--timeout", "10000", "bar"]);
+    assert!(ok && v["code"] == 0, "{v}");
+    assert_eq!(lines(&d, "bar"), ["   Compiling x v1.0"], "the bar's segments are dropped, the line after one kept");
+    let (ok, h) = d.collie("t:p1", &["history", "bar"]);
+    let run = &h["runs"][0];
+    assert!(ok && run["progress"].is_null() && run.get("steps").is_none(), "{h}");
+}
+
+#[test]
 fn todos_are_scanned_and_those_a_branch_added_are_new() {
     let d = Daemon::new("problems-todo");
     let repo = d.0.join("repo");

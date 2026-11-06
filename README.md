@@ -53,7 +53,7 @@ collie is the shared layer underneath:
 - **Offloading** — with no slot free, tests, lints and framework builds run on another Mac over SSH (see
   [Offloading to another Mac](#offloading-to-another-mac)), mirrored locally.
 - **History** — ended runs and their logs, kept 7 days.
-- **A terminal UI** — targets, tests, history, problems and live logs in one pane (`collie tui`), standalone
+- **A terminal UI** — targets, build progress, tests, history, problems and live logs in one pane (`collie tui`), standalone
   or inside herdr.
 - **Built for agents** — every command takes `--json` (streams are NDJSON), errors carry stable codes, and
   `collie skill` prints a complete usage guide for an agent's context.
